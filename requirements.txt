@@ -1,0 +1,8 @@
+Django==4.2.26
+djangorestframework==3.14.0
+psycopg2-binary==2.9.9
+python-dotenv==1.0.1
+geopy==2.4.1
+pgeocode==0.4.1
+psycopg2-binary==2.9.9
+django-cors-headers==4.4.0
