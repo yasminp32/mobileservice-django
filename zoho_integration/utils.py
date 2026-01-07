@@ -47,3 +47,21 @@ def get_zoho_access_token() -> str:
 
     return j["access_token"]
 
+class ZohoBooksError(Exception):
+    pass
+
+def _zoho_raise_if_error(resp: requests.Response, action: str) -> dict:
+    try:
+        data = resp.json() if resp.content else {}
+    except Exception:
+        data = {"raw": (resp.text or "")[:1000]}
+
+    if resp.status_code >= 400:
+        raise ZohoBooksError(f"{action} failed (HTTP {resp.status_code}): {data}")
+
+    if isinstance(data, dict) and data.get("code") not in (None, 0):
+        raise ZohoBooksError(f"{action} failed (Zoho code {data.get('code')}): {data}")
+
+    return data
+
+

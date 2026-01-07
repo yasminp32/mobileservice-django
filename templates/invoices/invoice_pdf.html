@@ -1,0 +1,429 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    @page { size: A4; margin: 14mm; }
+
+    :root{
+      --navy: #0f2f54;     /* dark top wave */
+      --blue: #1e4d86;     /* bottom wave + table header */
+      --text: #0f172a;
+      --muted:#475569;
+      --line: #cfd8e3;
+      --soft:#f6f8fc;
+    }
+
+    body{
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+      color: var(--text);
+      margin: 0;
+      padding: 0;
+    }
+
+    .page{
+      border: 1px solid #0b1220;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #fff;
+      position: relative;
+    }
+
+    /* ======= TOP WAVE ======= */
+    .top-wave{
+      height: 110px;
+      background: var(--navy);
+      position: relative;
+    }
+    .top-wave:after{
+      content:"";
+      position:absolute;
+      left:-25%;
+      right:-25%;
+      top:30px;
+      height:140px;
+      background:#fff;
+      border-radius: 0 0 65% 65%;
+    }
+
+    /* ======= BOTTOM WAVE ======= */
+    .bottom-wave{
+      height: 120px;
+      background: var(--blue);
+      position: relative;
+      margin-top: 18px;
+    }
+    .bottom-wave:before{
+      content:"";
+      position:absolute;
+      left:-25%;
+      right:-25%;
+      top:-85px;
+      height:160px;
+      background:#fff;
+      border-radius: 65% 65% 0 0;
+    }
+
+    .content{
+      padding: 18px 22px 10px 22px;
+      position: relative;
+      z-index: 2;
+    }
+
+    /* Header row: INVOICE left, Logo right */
+    .header{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      align-items: start;
+      margin-top: 4px;
+    }
+
+    .h-title{
+      font-size: 30px;
+      font-weight: 900;
+      letter-spacing: 1px;
+      margin: 0 0 6px 0;
+    }
+
+    .small{
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .logo-box{
+      text-align: right;
+      padding-top: 6px;
+    }
+
+    .logo{
+      width: 170px;
+      height: auto;
+      display: inline-block;
+    }
+
+    /* Two blocks: BILL TO + PAYMENT INFO */
+    .two-box{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .box{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fff;
+    }
+    .box .head{
+      background: var(--soft);
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      font-weight: 900;
+      letter-spacing: .4px;
+      text-transform: uppercase;
+      font-size: 11px;
+    }
+    .box .body{
+      padding: 10px 10px;
+      line-height: 1.55;
+    }
+
+    .name{
+      font-weight: 900;
+      margin-bottom: 2px;
+    }
+
+    /* Items table */
+    .items{
+      margin-top: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    table{
+      width: 100%;
+      border-collapse: collapse;
+    }
+  
+    .items thead th{
+      background: var(--blue);
+      color: #fff;
+      padding: 10px 10px;
+      font-size: 11px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      text-align: left;
+    }
+
+    .items tbody td{
+      padding: 10px 10px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+
+    .items tbody tr:nth-child(even) td{
+      background: #fbfcff;
+    }
+
+    .items tbody tr:last-child td{
+      border-bottom: none;
+    }
+
+    .right{ text-align: right; }
+
+    .item-title{
+      font-weight: 900;
+      margin-bottom: 2px;
+    }
+
+    /* Bottom section */
+    .bottom{
+      display: grid;
+      grid-template-columns: 1fr 0.6fr;
+      gap: 14px;
+      margin-top: 16px;
+      align-items: start;
+    }
+
+    .notes{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      min-height: 120px;
+      background: #fff;
+    }
+
+    .label{
+      font-weight: 900;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: .4px;
+    }
+
+    .ital{ font-style: italic; }
+
+    .totals{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .trow{
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      font-size: 12px;
+    }
+    .trow:last-child{ border-bottom: none; }
+
+    .neg{ color:#b91c1c; }
+
+    /* Blue TOTAL BAR like screenshot */
+    .total-bar{
+      margin-top: 10px;
+      background: var(--blue);
+      color: #fff;
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: flex;
+      justify-content: space-between;
+      font-weight: 900;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+    }
+
+    .footer-note{
+      margin-top: 10px;
+      font-size: 10.5px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+
+<body>
+  <div class="page">
+    <div class="top-wave"></div>
+
+    <div class="content">
+
+      <!-- HEADER -->
+      <div class="header">
+        <div>
+          <div class="h-title">INVOICE</div>
+          <div class="small">
+            Invoice Number: <b>{{ invoice.invoice_number }}</b><br/>
+            Date: <b>{{ invoice.invoice_date }}</b>
+          </div>
+        </div>
+
+        <div class="logo-box">
+          {% if logo_url %}
+            <img class="logo" src="{{ logo_url }}" alt="logo" />
+          {% else %}
+            <div style="font-weight:900; font-size:16px;">{{ company_name|default:"Nabeel org" }}</div>
+            <div class="small">{{ company_state|default:"Kerala" }}, {{ company_country|default:"India" }}</div>
+            <div class="small">{{ company_email|default:"" }}</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- BILL TO + PAYMENT INFO -->
+      <div class="two-box">
+        <div class="box">
+          <div class="head">Bill To</div>
+          <div class="body">
+            <div class="name">{{ invoice.customer.name }}</div>
+            {% if invoice.customer.email %}<div class="small">{{ invoice.customer.email }}</div>{% endif %}
+            {% if invoice.customer.phone %}<div class="small">{{ invoice.customer.phone }}</div>{% endif %}
+            {% if invoice.customer.state %}<div class="small">{{ invoice.customer.state }}</div>{% endif %}
+            <div class="small">India</div>
+          </div>
+        </div>
+
+        <div class="box">
+          <div class="head">Payment Information</div>
+          <div class="body">
+            <div><b>Terms:</b> {{ terms|default:"Custom" }}</div>
+            <div><b>Due Date:</b> {{ invoice.due_date|default:"-" }}</div>
+            <div><b>Status:</b> {{ invoice.status }}</div>
+          </div>
+        </div>
+      </div>
+      
+      
+      <!-- ITEMS -->
+      <div class="items"> 
+        <table class="items-table"> 
+          <colgroup> 
+            <col style="width:50px;"> 
+            <col>
+            <col style="width:70px;">  
+            <col style="width:90px;"> 
+            <col style="width:110px;"> 
+            <col style="width:80px;"> 
+            <col style="width:120px;"> 
+          </colgroup> 
+          <thead> 
+            <tr> 
+              <th>#</th>
+              <th>Item</th> 
+              <th>Qty</th> 
+              <th>Rate</th> 
+              <th>Service</th>
+              <th>GST</th>
+              <th>Amount</th> 
+            </tr> 
+          </thead> 
+          <tbody> {% for line in lines %} 
+            <tr> 
+              <td>{{ forloop.counter }}</td> 
+              <td><div class="item-title">{{ line.item.name }}</div>
+              
+                {% if line.description %}
+                  <div class="small" style="margin-top:4px; color:#475569;">
+                    {{ line.description|linebreaksbr }}
+                  </div>
+                {% endif %}
+              </td> 
+              <td>{{ line.qty }}</td> 
+              <td>{{ line.rate }}</td>
+              <td>{{ line.service_charge_amount }}</td> 
+              <td>
+                
+                  {% if line.gst_treatment and line.gst_treatment != "NO_TAX" %}
+                    {{ line.gst_treatment }}%
+                  {% else %}
+                     0%
+                  {% endif %}
+                </td>
+              <td>{{ line.line_total }}</td> 
+            </tr> {% endfor %} 
+          </tbody> 
+        </table> 
+      </div>
+      <!-- BOTTOM -->
+       
+      <div class="bottom">
+        <div class="notes">
+          <div class="label">Total In Words</div>
+          <div class="ital" style="margin-bottom: 14px;">
+            {{ total_in_words|default:"-" }}
+          </div>
+
+          <div class="label">Terms and Conditions</div>
+            <div class="small">
+               {% if terms_conditions %}
+                  {{ terms_conditions|linebreaksbr }}
+               {% else %}
+                   -
+               {% endif %}
+            </div>
+            <div class="small"> {{ notes|default:"Thanks for your business." }} </div>
+        </div>
+
+        <div>
+          <div class="totals">
+            <div class="trow"><span>Sub Total</span><span>{{ currency_symbol|default:"₹" }}{{ invoice.sub_total }}</span></div>
+            <div class="trow"><span>Discount</span><span class="neg">(-) {{ currency_symbol|default:"₹" }}{{ invoice.discount_amount }}</span></div>
+            <div class="trow"><span>Service Charge</span><span>{{ currency_symbol|default:"₹" }}{{ invoice.service_charge_total }}</span></div>
+            <!--<div class="trow"><span>Tax</span><span>{{ currency_symbol|default:"₹" }}{{ total_tax|default:"0.00" }}</span></div>-->
+            {% if gst_rows %}
+            <div class="tax-box">
+              <div class="tax-title">Tax Summary</div>
+          
+              {% for r in gst_rows %}
+                {% if r.mode == "IGST" %}
+                  <div class="tax-row">
+                    <span>IGST @ {{ r.igst_rate }}% on {{ currency_symbol|default:"₹" }}{{ r.taxable }}</span>
+                    <span class="right">{{ currency_symbol|default:"₹" }}{{ r.igst_tax }}</span>
+                  </div>
+                {% else %}
+                  <div class="tax-row">
+                    <span>CGST @ {{ r.cgst_rate }}% on {{ currency_symbol|default:"₹" }}{{ r.taxable }}</span>
+                    <span class="right">{{ currency_symbol|default:"₹" }}{{ r.cgst_tax }}</span>
+                  </div>
+                  <div class="tax-row">
+                    <span>SGST @ {{ r.sgst_rate }}% on {{ currency_symbol|default:"₹" }}{{ r.taxable }}</span>
+                    <span class="right">{{ currency_symbol|default:"₹" }}{{ r.sgst_tax }}</span>
+                  </div>
+                {% endif %}
+              {% endfor %}
+            </div>
+          
+            <div class="trow" style="font-weight:900;">
+              <span>Total Tax</span>
+              <span>{{ currency_symbol|default:"₹" }}{{ total_tax|default:"0.00" }}</span>
+            </div>
+          {% else %}
+            <div class="trow"><span>Tax</span><span>{{ currency_symbol|default:"₹" }}0.00</span></div>
+          {% endif %}
+          
+          </div>
+          
+          <div class="total-bar">
+            <span>Total</span>
+            <span>{{ currency_symbol|default:"₹" }}{{ invoice.grand_total }}</span>
+          </div>
+
+          <div class="footer-note" style="text-align:right;">
+            Balance Due: <b>{{ currency_symbol|default:"₹" }}{{ invoice.grand_total }}</b>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="bottom-wave"></div>
+  </div>
+</body>
+</html>

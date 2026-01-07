@@ -32,7 +32,8 @@ CORS_ALLOW_HEADERS = ["*"]
 CORS_ALLOW_METHODS = ["*"]
 CORS_ALLOW_CREDENTIALS = True
 #print("LOADED ALLOWED_HOSTS =", ALLOWED_HOSTS)
-
+LOGIN_REDIRECT_URL = "/api/"
+LOGOUT_REDIRECT_URL = "/api/"
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -45,6 +46,7 @@ INSTALLED_APPS = [
     "rest_framework.authtoken",
     "core",
     "zoho_integration",
+    "expenses",
 ]
 
 MIDDLEWARE = [
@@ -121,11 +123,15 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
         "rest_framework.authentication.TokenAuthentication",
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
-        "rest_framework.permissions.AllowAny"
-    ]
+        
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+     
 }
 
 # Auto-assign settings
@@ -138,7 +144,7 @@ EMAIL_PORT = 587
 EMAIL_USE_TLS = True
 
 EMAIL_HOST_USER = "yasminp32@gmail.com"
-EMAIL_HOST_PASSWORD = "npfl ltck khno gqkr"  # NOT your Gmail password
+EMAIL_HOST_PASSWORD = "vaxw jwwf voap bzxh"  # NOT your Gmail password
 
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 # =========================

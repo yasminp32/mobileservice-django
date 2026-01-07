@@ -1,10 +1,11 @@
 from rest_framework import viewsets, status
-from rest_framework.decorators import action, api_view
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db import IntegrityError
 from django.conf import settings
-from .models import Shop, Growtags, Complaint,GrowTagAssignment,Customer
-from .serializers import ShopSerializer, GrowtagsSerializer, ComplaintSerializer,GrowTagAssignmentSerializer,CustomerSerializer
+from .models import Shop, Growtags, Complaint,GrowTagAssignment,Customer,Lead
+from .serializers import ShopSerializer, GrowtagsSerializer, ComplaintSerializer,GrowTagAssignmentSerializer,CustomerSerializer,LeadSerializer
+from .serializers import  ShopViewSerializer, GrowtagViewSerializer
 from .services import _ensure_complaint_coords,sync_complaint_to_customer
 from .services import (
     geocode_address_pincode,
@@ -12,21 +13,50 @@ from .services import (
     get_nearest_shop,
     get_nearest_growtag,
 )
-
-
+from zoho_integration.customer_sync import sync_core_customer_to_zoho_contact
+from zoho_integration.zoho_books import ZohoBooksError
 from django.db.models import Q
-
+from rest_framework import generics
+from rest_framework.permissions import IsAuthenticated,AllowAny
+from rest_framework.views import APIView
+from django.utils import timezone
+from django.shortcuts import get_object_or_404
 from django.core.mail import send_mail
+from django.contrib.auth import get_user_model
 
-class ShopViewSet(viewsets.ModelViewSet):
+from core.permissions import IsCustomer
+from core.authentication import CustomerTokenAuthentication
+from core.serializers import CustomerRegisterSerializer, CustomerLoginSerializer, PublicComplaintSerializer
+from core.models import CustomerAuthToken
+from django.contrib.auth.hashers import check_password
+User = get_user_model()
+
+class CreatedByMixin:
+    def perform_create(self, serializer):
+        user = self.request.user if self.request.user.is_authenticated else None
+        serializer.save(created_by=user)
+
+class ShopViewSet(CreatedByMixin, viewsets.ModelViewSet):
     
     queryset = Shop.objects.all()
     serializer_class = ShopSerializer
+    @action(detail=True, methods=["get"], url_path="view")
+    def view_popup(self, request, pk=None):
+        shop = self.get_object()
+        data = ShopViewSerializer(shop).data
+        return Response(data)
 
     def create(self, request, *args, **kwargs):
         data = request.data.copy()
-        area = data.get("area", "")
-        pincode = data.get("pincode", "")
+        #area = data.get("area", "")
+        #pincode = data.get("pincode", "")
+        area = (data.get("area") or "").strip()
+        pincode = (data.get("pincode") or "").strip()
+
+        # normalize optional fields (avoid storing "")
+        for f in ["email", "phone", "gst_pin"]:
+           if data.get(f) in ("", None):
+                data[f] = None
 
         lat_lon = geocode_address_pincode(area, pincode)
     
@@ -38,18 +68,17 @@ class ShopViewSet(viewsets.ModelViewSet):
             serializer = self.get_serializer(data=data)
             serializer.is_valid(raise_exception=True)
             self.perform_create(serializer)
-        #return Response(serializer.data, status=status.HTTP_201_CREATED)
-            return Response(
-                {
-                    "status": "success",
-                    "message": "Shop created successfully",
-                    "data": serializer.data,
-                },
-                status=status.HTTP_201_CREATED,
-            )
+        
+            
         except IntegrityError as e:
 
             error_message=str(e).lower()
+            if "email" in error_message:
+                return Response({
+                       "status": "error",
+                        "message": "email already exists",
+                        "error": {"email": ["this email already exists"]}
+                    }, status=400)
             
             if "phone" in error_message:
                 return Response({
@@ -65,11 +94,50 @@ class ShopViewSet(viewsets.ModelViewSet):
                     "error":{"gst_pin":["this gst pin already exists"]}
                 },status=status.HTTP_400_BAD_REQUEST)
                 
-        return Response({
+            return Response({
                 "status":"error",
                 "message":"database error",
                 "error":str(e)
             },status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+                {
+                    "status": "success",
+                    "message": "Shop created successfully",
+                    "data": serializer.data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+    def perform_create(self, serializer):
+        shop = serializer.save()
+
+        # admin emails
+        admin_emails = (
+            User.objects.filter(is_superuser=True)
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .values_list("email", flat=True)
+        )
+
+        recipients = list(admin_emails)
+
+        if shop.email:
+            recipients = [shop.email] + recipients
+
+        recipients = list(dict.fromkeys(recipients))  # unique
+
+        if recipients:
+            send_mail(
+                subject="New Shop Created",
+                message=(
+                    "A new shop has been created.\n\n"
+                    f"Shop Name: {shop.shopname}\n"
+                    f"Owner: {shop.owner}\n"
+                    f"Phone: {shop.phone}\n"
+                ),
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=recipients,
+                fail_silently=True,
+            )
      # Franchise dropdown
     # GET /api/shops/franchise/
     @action(detail=False, methods=["get"], url_path="franchise")
@@ -85,9 +153,14 @@ class ShopViewSet(viewsets.ModelViewSet):
         return Response(ShopSerializer(qs, many=True).data)
 
 
-class GrowtagsViewSet(viewsets.ModelViewSet):
+class GrowtagsViewSet(CreatedByMixin, viewsets.ModelViewSet):
     queryset = Growtags.objects.all()
     serializer_class = GrowtagsSerializer
+    @action(detail=True, methods=["get"], url_path="view")
+    def view_popup(self, request, pk=None):
+        growtag = self.get_object()
+        data = GrowtagViewSerializer(growtag).data
+        return Response(data)
 
     def create(self, request, *args, **kwargs):
         data = request.data.copy()
@@ -104,6 +177,43 @@ class GrowtagsViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+    def perform_create(self, serializer):
+        growtag = serializer.save()
+
+        # admin emails
+        admin_emails = (
+            User.objects.filter(is_superuser=True)
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .values_list("email", flat=True)
+        )
+
+        recipients = list(admin_emails)
+
+        # growtag email
+        if growtag.email:
+            recipients = [growtag.email] + recipients
+
+        recipients = list(dict.fromkeys(recipients))  # unique
+
+        if recipients:
+            send_mail(
+                subject="New Growtag Created",
+                message=(
+                    "A new Growtag has been created.\n\n"
+                    f"Grow ID: {growtag.grow_id}\n"
+                    f"Name: {growtag.name}\n"
+                    f"Email: {growtag.email}\n"
+                    f"Phone: {growtag.phone or '-'}\n"
+                    f"Adhar: {growtag.adhar or '-'}\n"
+                    f"Area: {growtag.area or '-'}\n"
+                    f"Pincode: {growtag.pincode}\n"
+                    f"Status: {growtag.status}\n"
+                ),
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=recipients,
+                fail_silently=True,  # set False while testing
+            )
     # Active GrowTags dropdown
     # GET /api/growtags/active/
     @action(detail=False, methods=["get"], url_path="active")
@@ -141,14 +251,14 @@ class GrowtagsViewSet(viewsets.ModelViewSet):
             }
         )
 
-class CustomerViewSet(viewsets.ModelViewSet):
+class CustomerViewSet(CreatedByMixin, viewsets.ModelViewSet):
     #queryset = Customer.objects.all().order_by("-created_at")
     queryset = Customer.objects.all().prefetch_related("complaints")  # ⚡ faster
     serializer_class = CustomerSerializer
 
 
 
-class ComplaintViewSet(viewsets.ModelViewSet):
+class ComplaintViewSet(CreatedByMixin,viewsets.ModelViewSet):
     queryset = Complaint.objects.all().order_by("-created_at")
     serializer_class = ComplaintSerializer
 
@@ -158,19 +268,19 @@ class ComplaintViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
+        customer_name = data.get("customer_name")
+        customer_phone = data.get("customer_phone")
+        email = data.get("email")
+        password = data.get("password")
+        phone_model = data.get("phone_model")
+        issue_details = data.get("issue_details")
+        address = data.get("address")
+        state = data.get("state")
+        pincode = data.get("pincode")
+        assign_to = data.get("assign_to")
+        status_value = data.get("status", "Pending")
+        area = data.get("area", "")  # ✅ define area
 
-        customer_name   = data.get("customer_name")
-        customer_phone  = data.get("customer_phone")
-        email           = data.get("email")
-        password        = data.get("password")
-        phone_model     = data.get("phone_model")
-        issue_details   = data.get("issue_details")
-        address         = data.get("address")
-        pincode         = data.get("pincode")
-        assign_to       = data.get("assign_to")
-        status_value    = data.get("status", "Pending")
-        area            = data.get("area", "")   # ✅ define area
-        
         # 3️⃣ Find existing customer by phone OR email
         lookup = Q()
         if customer_phone:
@@ -182,32 +292,22 @@ class ComplaintViewSet(viewsets.ModelViewSet):
         if lookup:
             customer = Customer.objects.filter(lookup).first()
 
-        # 4️⃣ If customer already exists, check for conflicts (phone/email/name/password)
+        # 4️⃣ If customer already exists, check for conflicts
         if customer:
             conflict_messages = {}
 
-            # 🔹 Phone is sent AND belongs to another existing customer
-            if customer_phone and customer.customer_phone != customer_phone:
-                conflict_messages["phone"] = "This phone number is already registered to another customer."
-
-            # 🔹 Email is sent AND belongs to another existing customer
-            if email and customer.email and customer.email != email:
-                conflict_messages["email"] = "This email is already registered to another customer."
-
-            # 🔹 Name mismatch (trying to use someone else’s account)
+            # Name mismatch
             if customer_name and customer.customer_name and customer.customer_name != customer_name:
                 conflict_messages["customer_name"] = "Customer name does not match the existing account."
 
-            # 🔹 Password mismatch (wrong user using same phone/email)
+            # Password mismatch
             if password and customer.password and customer.password != password:
                 conflict_messages["password"] = "Password does not match the existing account."
 
-            # ❌ If any conflicts exist → reject request
             if conflict_messages:
                 return Response(conflict_messages, status=status.HTTP_400_BAD_REQUEST)
-                
 
-            # ✅ No conflict → reuse same customer as-is
+            # ✅ No conflict → reuse same customer
 
         else:
             # 5️⃣ No existing customer → create a new one
@@ -217,8 +317,17 @@ class ComplaintViewSet(viewsets.ModelViewSet):
                 email=email,
                 password=password,
                 address=address,
+                state=state,
                 pincode=pincode,
+                area=area,
             )
+
+        # ✅ Zoho sync (best-effort)
+        try:
+            local_customer = sync_core_customer_to_zoho_contact(customer)
+            print("Zoho contact synced:", local_customer.zoho_contact_id)
+        except Exception as e:
+            print("Zoho customer sync failed:", str(e))
 
         # 6️⃣ Create complaint linked to that customer
         complaint = Complaint.objects.create(
@@ -230,16 +339,17 @@ class ComplaintViewSet(viewsets.ModelViewSet):
             phone_model=phone_model,
             issue_details=issue_details,
             address=address,
+            state=state,
             pincode=pincode,
             area=area,
             assign_to=assign_to,
             status=status_value,
         )
-        # Geocode via helper
-        # 3️⃣ Ensure complaint has coordinates (centralized helper)
-        _ensure_complaint_coords(complaint)    
 
-        # 4️⃣ Auto-Assign Shop/GrowTag
+        # ✅ Ensure coords
+        _ensure_complaint_coords(complaint)
+
+        # ✅ Auto-Assign Shop/GrowTag
         assigned_shop = None
         assigned_gt = None
         distance_km = None
@@ -259,7 +369,7 @@ class ComplaintViewSet(viewsets.ModelViewSet):
             if result:
                 assigned_gt, distance_km = result
 
-        # ✅ Apply to complaint
+        # ✅ Apply assignment
         if assigned_shop:
             complaint.assigned_shop = assigned_shop
             complaint.status = "Assigned"
@@ -269,12 +379,13 @@ class ComplaintViewSet(viewsets.ModelViewSet):
             complaint.status = "Assigned"
 
         complaint.save()
-         #  🔁 Sync COMPLAINT → CUSTOMER
+
+        # 🔁 Sync COMPLAINT → CUSTOMER
         sync_complaint_to_customer(complaint)
+
         # 5️⃣ Send email
         if complaint.email:
             subject = f"Complaint Registered Successfully (ID: {complaint.id})"
-
             message = (
                 f"Dear {complaint.customer_name},\n\n"
                 f"Your complaint has been registered successfully.\n\n"
@@ -286,6 +397,7 @@ class ComplaintViewSet(viewsets.ModelViewSet):
                 f"Password: {complaint.password or ''}\n"
                 f"Phone Model: {complaint.phone_model}\n"
                 f"Address: {complaint.address}\n"
+                f"Address: {complaint.state}\n"
                 f"Pincode: {complaint.pincode}\n"
                 f"Issue: {complaint.issue_details}\n"
                 f"Assign To: {complaint.assign_to}\n"
@@ -316,111 +428,101 @@ class ComplaintViewSet(viewsets.ModelViewSet):
         and auto-assign nearest based on assign_to.
         """
         partial = kwargs.pop("partial", False)
-        complaint= self.get_object()
+        complaint = self.get_object()
 
         serializer = self.get_serializer(complaint, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
-        
-        # 👇 did client send status in this request?
-        status_in_request = "status" in serializer.validated_data
-        # ====== 1️⃣ CUSTOMER LOGIC (SAME STYLE AS create()) ======
+        data = serializer.validated_data
 
-        # 🌟 For partial update: fall back to existing values on complaint
-        customer_name   = data.get("customer_name", complaint.customer_name)
-        customer_phone  = data.get("customer_phone", complaint.customer_phone)
-        email           = data.get("email", complaint.email)
-        password        = data.get("password", complaint.password)
-        address         = data.get("address", complaint.address)
-        pincode         = data.get("pincode", complaint.pincode)
-        area            = data.get("area", complaint.area)
+        # did client send status in this request?
+        status_in_request = "status" in data
 
-        # Currently linked customer (may be None)
-        customer = complaint.customer
-        # 🔍 Lookup existing customer by phone OR email
-        #phone = serializer.validated_data.get("customer_phone")
-        #email = serializer.validated_data.get("email")
-        #existing_customer = None
-        # 🔍 Build lookup by phone/email
+        # ✅ For PUT: require these fields
+        if not partial:
+            required = [
+                "customer_name",
+                "customer_phone",
+                "phone_model",
+                "issue_details",
+                "address",
+                "state",
+                "pincode",
+                "assign_to",
+                "area",
+            ]
+            missing = [f for f in required if f not in data]
+            if missing:
+                return Response(
+                    {"detail": f"PUT requires fields: {', '.join(missing)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # ====== 1️⃣ CUSTOMER LOGIC ======
+        customer_name = data.get("customer_name", complaint.customer_name)
+        customer_phone = data.get("customer_phone", complaint.customer_phone)
+        email = data.get("email", complaint.email)
+        password = data.get("password", complaint.password)
+        address = data.get("address", complaint.address)
+        state = data.get("state", complaint.state)
+        pincode = data.get("pincode", complaint.pincode)
+        area = data.get("area", complaint.area)
+
+        customer = complaint.customer  # may be None
+
+        # 🔍 find any customer with same phone/email
         lookup = Q()
         if customer_phone:
             lookup |= Q(customer_phone=customer_phone)
         if email:
             lookup |= Q(email=email)
 
-        existing_customer = None
-        if lookup:
-            existing_customer = Customer.objects.filter(lookup).first()
-        
-    # 🔗 If we found an existing customer, link the complaint to that customer
+        existing_customer = Customer.objects.filter(lookup).first() if lookup else None
+
         if existing_customer:
-            # ✅ There IS a customer with this phone/email
             conflict_messages = {}
 
-            # These checks are same idea as in create()
+            # ✅ If found customer is NOT the same as currently linked customer,
+            # block only when user is trying to impersonate (name/pass mismatch)
+            if customer and existing_customer.id != customer.id:
+                if customer_name and existing_customer.customer_name != customer_name:
+                    conflict_messages["customer_name"] = "Customer name does not match the existing account."
+                if password and existing_customer.password != password:
+                    conflict_messages["password"] = "Password does not match the existing account."
+                if conflict_messages:
+                    return Response(conflict_messages, status=status.HTTP_400_BAD_REQUEST)
 
-            # 🔹 Phone conflict (trying to use some other customer's phone)
-            if (
-                customer_phone
-                and existing_customer.customer_phone
-                and existing_customer.customer_phone != customer_phone
-            ):
-                conflict_messages["phone"] = (
-                    "This phone number is already registered to another customer."
-                )
+                # ✅ link complaint to found customer
+                customer = existing_customer
 
-            # 🔹 Email conflict (trying to use some other customer's email)
-            if (
-                email
-                and existing_customer.email
-                and existing_customer.email != email
-            ):
-                conflict_messages["email"] = (
-                    "This email is already registered to another customer."
-                )
+            # If complaint had no customer, link it
+            if customer is None:
+                customer = existing_customer
 
-            # 🔹 Name mismatch (wrong name for this phone/email)
-            if (
-                customer_name
-                and existing_customer.customer_name
-                and existing_customer.customer_name != customer_name
-            ):
-                conflict_messages["customer_name"] = (
-                    "Customer name does not match the existing account."
-                )
-
-            # 🔹 Password mismatch (wrong password for this phone/email)
-            if (
-                password
-                and existing_customer.password
-                and existing_customer.password != password
-            ):
-                conflict_messages["password"] = (
-                    "Password does not match the existing account."
-                )
-
-            # ❌ If any conflicts → block update
-            if conflict_messages:
-                return Response(conflict_messages, status=status.HTTP_400_BAD_REQUEST)
-
-            # ✅ No conflict → reuse the existing customer
-            customer = existing_customer
+        # If still no customer → create
+        if customer is None:
+            customer = Customer.objects.create(
+                customer_name=customer_name,
+                customer_phone=customer_phone,
+                email=email,
+                password=password,
+                address=address,
+                state=state,
+                pincode=pincode,
+                area=area,
+            )
 
         else:
-            # ❌ No existing customer with this phone/email
-            if customer is None:
-                # There was no customer before → create new
-                customer = Customer.objects.create(
-                    customer_name=customer_name,
-                    customer_phone=customer_phone,
-                    email=email,
-                    password=password,
-                    address=address,
-                    pincode=pincode,
-                    area=area,
-                )
+            # Update customer (PUT updates all, PATCH updates sent fields only)
+            if not partial:
+                customer.customer_name = customer_name
+                customer.customer_phone = customer_phone
+                customer.email = email
+                customer.password = password
+                customer.address = address
+                customer.state= state
+                customer.pincode = pincode
+                customer.area = area
             else:
-                # Complaint already linked to a customer → update THAT customer
-                # only if fields were sent in this request
                 if "customer_name" in data:
                     customer.customer_name = customer_name
                 if "customer_phone" in data:
@@ -431,42 +533,51 @@ class ComplaintViewSet(viewsets.ModelViewSet):
                     customer.password = password
                 if "address" in data:
                     customer.address = address
+                if "state" in data:
+                    customer.state = state    
                 if "pincode" in data:
                     customer.pincode = pincode
                 if "area" in data:
                     customer.area = area
-                customer.save()
+
+            customer.save()
+
+        # ✅ Zoho sync (best-effort)
+        try:
+            local_customer = sync_core_customer_to_zoho_contact(customer)
+            print("Zoho contact synced:", local_customer.zoho_contact_id)
+        except Exception as e:
+            print("Zoho customer sync failed:", str(e))
 
         # ====== 2️⃣ SAVE COMPLAINT WITH CORRECT CUSTOMER ======
         complaint = serializer.save(customer=customer)
 
-        # Keep complaint fields in sync with customer table
-        if customer:
-            complaint.customer_name = customer.customer_name
-            complaint.customer_phone = customer.customer_phone
-            complaint.email = customer.email
-            complaint.password = customer.password
-            complaint.address = customer.address
-            complaint.pincode = customer.pincode
-            complaint.area = customer.area
-            complaint.save(
-                update_fields=[
-                    "customer_name",
-                    "customer_phone",
-                    "email",
-                    "password",
-                    "address",
-                    "pincode",
-                    "area",
-                ]
-            )
-          
-        
-         
-        #complaint = serializer.save()
-         # ✅ Ensure we have coordinates (frontend or geocode fallback)
+        # Keep complaint fields in sync with customer
+        complaint.customer_name = customer.customer_name
+        complaint.customer_phone = customer.customer_phone
+        complaint.email = customer.email
+        complaint.password = customer.password
+        complaint.address = customer.address
+        complaint.state = customer.state
+        complaint.pincode = customer.pincode
+        complaint.area = customer.area
+        complaint.save(
+            update_fields=[
+                "customer_name",
+                "customer_phone",
+                "email",
+                "password",
+                "address",
+                "state",
+                "pincode",
+                "area",
+            ]
+        )
+
+        # ✅ Ensure coords
         _ensure_complaint_coords(complaint)
-        assign_to = serializer.validated_data.get("assign_to", complaint.assign_to)
+
+        assign_to = data.get("assign_to", complaint.assign_to)
         complaint.assign_to = assign_to
 
         assigned_shop = None
@@ -487,25 +598,25 @@ class ComplaintViewSet(viewsets.ModelViewSet):
 
         if assigned_shop:
             complaint.assigned_shop = assigned_shop
-            if not status_in_request: # 👈 only override IF client didn’t send status
-              complaint.status = "Assigned"
+            if not status_in_request:
+                complaint.status = "Assigned"
 
         if assigned_gt:
             complaint.assigned_Growtags = assigned_gt
-            if not status_in_request: # 👈 same here
-              complaint.status = "Assigned"
+            if not status_in_request:
+                complaint.status = "Assigned"
 
         complaint.save()
-        # 🔁 SYNC COMPLAINT → CUSTOMER (single helper, no duplicated code)
+
+        # 🔁 Sync COMPLAINT → CUSTOMER
         sync_complaint_to_customer(complaint)
+
         return Response(self.get_serializer(complaint).data)
 
-    # 🔹 PATCH handler (place this right after update)
+    # ----------------- PATCH -----------------
     def partial_update(self, request, *args, **kwargs):
         kwargs["partial"] = True
         return self.update(request, *args, **kwargs)
-
-
     # ----------------- NEAREST OPTIONS (for 2nd dropdown) -----------------
     @action(detail=False, methods=["get"], url_path="nearest-options")
     def nearest_options(self, request):
@@ -540,7 +651,7 @@ class ComplaintViewSet(viewsets.ModelViewSet):
 
       
 
-class GrowTagAssignmentViewSet(viewsets.ModelViewSet):
+class GrowTagAssignmentViewSet(CreatedByMixin, viewsets.ModelViewSet):
     queryset = GrowTagAssignment.objects.select_related("growtag", "shop").order_by("-assigned_at")
     serializer_class = GrowTagAssignmentSerializer
 
@@ -585,7 +696,7 @@ class GrowTagAssignmentViewSet(viewsets.ModelViewSet):
             growtag=growtag,
             defaults={"shop": shop}
         )
-
+        self._send_assignment_email(assignment, created)
         return Response(self.get_serializer(assignment).data, status=201)
 
     # Unassign Selected
@@ -595,3 +706,378 @@ class GrowTagAssignmentViewSet(viewsets.ModelViewSet):
         assignment = self.get_object()
         assignment.delete()
         return Response(status=204)
+       #email
+    def _send_assignment_email(self, assignment, created: bool):
+       growtag = assignment.growtag
+       shop = assignment.shop
+
+       # admin emails
+       admin_emails = (
+          User.objects.filter(is_superuser=True)
+        .exclude(email__isnull=True)
+        .exclude(email="")
+        .values_list("email", flat=True)
+       )
+
+       recipients = list(admin_emails)
+
+       # growtag email
+       if getattr(growtag, "email", None):
+            recipients = [growtag.email] + recipients
+
+       recipients = list(dict.fromkeys(recipients))  # unique
+
+       if not recipients:
+            return
+
+       subject = "Growtag Assigned to Shop" if created else "Growtag Re-Assigned to Shop"
+
+       message = (
+        f"{'New' if created else 'Updated'} Growtag Assignment\n\n"
+        f"Grow ID: {growtag.grow_id}\n"
+        f"Growtag Name: {growtag.name}\n"
+        f"Growtag Email: {growtag.email}\n"
+        f"Shop: {shop.shopname}\n"
+        f"Shop Type: {shop.shop_type}\n"
+        f"Shop Phone: {shop.phone or '-'}\n"
+        f"Assigned At: {assignment.assigned_at}\n"
+        )
+
+       send_mail(
+          subject=subject,
+          message=message,
+          from_email=settings.DEFAULT_FROM_EMAIL,
+          recipient_list=recipients,
+          fail_silently=True,  # set False while testing
+        )
+
+#not confirmed
+class ConfirmComplaintAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, pk):
+        complaint = get_object_or_404(Complaint, pk=pk)
+
+        # 🔐 ROLE CHECK
+        if not (
+            request.user.is_staff
+            or hasattr(request.user, "shop")
+            or hasattr(request.user, "growtag")
+        ):
+            return Response(
+                {"error": "You are not allowed to confirm this complaint"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # ⚠️ ALREADY CONFIRMED
+        if complaint.confirm_status == "CONFIRMED":
+            return Response(
+                {"error": "Complaint already confirmed"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ✅ CONFIRM
+        complaint.confirm_status = "CONFIRMED"
+        complaint.confirmed_by = request.user
+        complaint.confirmed_at = timezone.now()
+        complaint.save(update_fields=[
+            "confirm_status",
+            "confirmed_by",
+            "confirmed_at"
+        ])
+
+        return Response(
+            {
+                "message": "Complaint confirmed successfully",
+                "confirm_status": complaint.confirm_status,
+                "confirmed_at": complaint.confirmed_at,
+                "confirmed_by": request.user.username,
+            },
+            status=status.HTTP_200_OK,
+        )
+    
+#public customer
+from django.db import transaction
+from .models import Customer
+from rest_framework.exceptions import ValidationError
+class CustomerRegisterView(APIView):
+    def post(self, request):
+        ser = CustomerRegisterSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        customer = ser.save()
+
+        token, _ = CustomerAuthToken.objects.get_or_create(
+            customer=customer,
+            defaults={"key": CustomerAuthToken.generate_key()}
+        )
+        return Response({"customer": ser.data, "token": token.key}, status=status.HTTP_201_CREATED)
+
+
+class CustomerLoginView(APIView):
+    def post(self, request):
+        ser = CustomerLoginSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        email = ser.validated_data["email"]
+        password = ser.validated_data["password"]
+
+        customer = Customer.objects.filter(email=email).first()
+        if not customer or not check_password(password, customer.password):
+            return Response({"detail": "Invalid email or password"}, status=status.HTTP_400_BAD_REQUEST)
+
+        token, _ = CustomerAuthToken.objects.get_or_create(
+            customer=customer,
+            defaults={"key": CustomerAuthToken.generate_key()}
+        )
+        return Response({"token": token.key, "customer_id": customer.id, "customer_name": customer.customer_name})
+    
+class PublicComplaintViewSet(viewsets.ModelViewSet):
+    serializer_class = PublicComplaintSerializer
+    authentication_classes = [CustomerTokenAuthentication]
+    permission_classes = [IsCustomer]
+    
+    def get_queryset(self):
+        customer = getattr(self.request, "customer", None)
+        if not customer:
+            return Complaint.objects.none()
+
+        # ✅ filtered by token customer id
+        return Complaint.objects.filter(customer_id=customer.id).order_by("-created_at")
+        #customer = self.request.user # Customer
+        #return Complaint.objects.filter(customer=customer).order_by("-created_at")
+
+    def perform_create(self, serializer):
+        customer = getattr(self.request, "customer", None)
+         # ✅ DEBUG (keep for 1 test, then remove)
+        print("validated_data:", serializer.validated_data)
+        print("address in validated_data:", serializer.validated_data.get("address"))
+
+        #customer = self.request.user
+        data = serializer.validated_data
+
+        phone = (data.get("customer_phone") or "").strip()
+        name  = (data.get("customer_name") or "").strip()
+        email = data.get("email") or None
+
+        if not phone:
+           raise ValidationError({"customer_phone": ["This field is required."]})
+        if not name:
+           raise ValidationError({"customer_name": ["This field is required."]})
+
+        with transaction.atomic():
+            customer, created = Customer.objects.get_or_create(
+             customer_phone=phone,
+               defaults={
+                "customer_name": name,
+                "email": email,
+                "address": data.get("address") or "",
+                "state": data.get("state") or "",
+                "pincode": data.get("pincode") or "",
+                "area": data.get("area") or "",
+            },
+        )
+
+        # If customer already exists, keep it updated (optional)
+            updates = []
+            if name and customer.customer_name != name:
+                customer.customer_name = name
+                updates.append("customer_name")
+            if email and customer.email != email:
+                customer.email = email
+                updates.append("email")
+            if updates:
+                customer.save(update_fields=updates)
+
+        complaint = serializer.save(
+                   customer=customer,
+                   customer_name=customer.customer_name,
+                   customer_phone=customer.customer_phone,
+                   address=data.get("address"),
+                   state=data.get("state"),
+                   pincode=data.get("pincode"),
+                   area=data.get("area"),
+                   status="Pending",
+        )
+
+        _ensure_complaint_coords(complaint)
+
+        if complaint.assign_to == "franchise":
+            result = get_nearest_shop(complaint, "franchise")
+            if result:
+                complaint.assigned_shop, _ = result
+                complaint.status = "Assigned"
+
+        elif complaint.assign_to == "othershop":
+             result = get_nearest_shop(complaint, "othershop")
+             if result:
+                 complaint.assigned_shop, _ = result
+                 complaint.status = "Assigned"
+
+        elif complaint.assign_to == "growtag":
+            result = get_nearest_growtag(complaint)
+            if result:
+                complaint.assigned_Growtags, _ = result
+                complaint.status = "Assigned"
+
+        complaint.save()
+        sync_complaint_to_customer(complaint)
+#lead viewset
+class LeadViewSet(viewsets.ModelViewSet):
+    queryset = Lead.objects.all().order_by("-created_at")
+    serializer_class = LeadSerializer
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def register_complaint(self, request, pk=None):
+        lead = self.get_object()
+        if lead.status == "CONVERTED":
+            return Response(
+               {"error": "Lead already converted"},
+                status=400
+            )
+
+        #lead = self.get_object()
+
+        assign_to = request.data.get("assign_to")
+        assigned_shop_id = request.data.get("assigned_shop")              # shop id
+        assigned_growtag_id = request.data.get("assigned_Growtags")       # growtag id
+
+        if assign_to not in ["franchise", "othershop", "growtag"]:
+            return Response({"error": "assign_to is required"}, status=400)
+
+        # ✅ manual assignment validation
+        assigned_shop = None
+        assigned_growtag = None
+
+        if assign_to in ["franchise", "othershop"]:
+            if not assigned_shop_id:
+                return Response({"error": "assigned_shop is required"}, status=400)
+            assigned_shop = Shop.objects.filter(id=assigned_shop_id).first()
+            if not assigned_shop:
+                return Response({"error": "assigned_shop invalid"}, status=400)
+
+        if assign_to == "growtag":
+            if not assigned_growtag_id:
+                return Response({"error": "assigned_Growtags is required"}, status=400)
+            assigned_growtag = Growtags.objects.filter(id=assigned_growtag_id).first()
+            if not assigned_growtag:
+                return Response({"error": "assigned_Growtags invalid"}, status=400)
+
+        # ✅ Create/find customer by phone (recommended)
+        customer, _ = Customer.objects.get_or_create(
+            customer_phone=lead.customer_phone,
+            defaults={
+                "customer_name": lead.customer_name,
+                "email": lead.email,
+                "address": lead.address,
+                "pincode": lead.pincode,
+            }
+        )
+
+        complaint = Complaint.objects.create(
+            customer=customer,
+            customer_name=lead.customer_name,
+            customer_phone=lead.customer_phone,
+            email=lead.email,
+            phone_model=lead.phone_model,
+            issue_details=lead.issue_detail,
+            address=lead.address,
+            pincode=lead.pincode,
+            area=getattr(lead, "area", None),
+
+            assign_to=assign_to,
+            assigned_shop=assigned_shop,
+            assigned_Growtags=assigned_growtag,
+
+            status="Assigned",  # since manually assigned now
+        )
+
+        # mark lead as converted
+        lead.status = "CONVERTED"
+        lead.save(update_fields=["status"])
+
+        return Response(
+            {"message": "Complaint created (manual assignment)", "complaint_id": complaint.id},
+            status=status.HTTP_201_CREATED
+        )
+    @action(detail=True, methods=["get"])
+    def complaint_prefill(self, request, pk=None):
+        lead = self.get_object()
+
+        return Response({
+            "customer_name": lead.customer_name,
+            "customer_phone": lead.customer_phone,
+            "email": lead.email,
+            "phone_model": lead.phone_model,
+            "issue_details": lead.issue_detail,
+            "address": lead.address,
+            "pincode": lead.pincode,
+            "area": getattr(lead, "area", None),
+
+            # defaults for form
+            "assign_to": "franchise",
+            "assigned_shop": None,
+            "assigned_Growtags": None,
+        })
+    
+class SalesIQLeadWebhook(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        payload = request.data or {}
+
+        visitor = payload.get("visitor") or {}
+        chat = payload.get("chat") or {}
+
+        # ✅ extract from visitor
+        phone = (visitor.get("phone") or "").strip()
+        email = (visitor.get("email") or "").strip() or None
+        name = (visitor.get("name") or "Unknown").strip()
+
+        # ✅ visitor id (if present)
+        visitor_id = (
+            payload.get("visitor_id")
+            or visitor.get("id")
+            or payload.get("salesiq_visitor_id")
+        )
+
+        # ✅ issue from chat (optional but recommended)
+        subject = (chat.get("subject") or "").strip()
+        message = (chat.get("message") or "").strip()
+        issue_detail = " - ".join([x for x in [subject, message] if x])
+
+        # dedupe: prefer phone else visitor_id
+        lead = None
+        if phone:
+            lead = Lead.objects.filter(customer_phone=phone).first()
+        if not lead and visitor_id:
+            lead = Lead.objects.filter(salesiq_visitor_id=visitor_id).first()
+
+        if lead:
+            lead.customer_name = name or lead.customer_name
+            lead.customer_phone = phone or lead.customer_phone
+            lead.email = email or lead.email
+            lead.source = "SALESIQ"
+            lead.raw_payload = payload
+
+            # save issue if your Lead model has it
+            if hasattr(lead, "issue_detail") and issue_detail:
+                lead.issue_detail = issue_detail
+
+            lead.save()
+            return Response({"message": "Lead updated", "lead_code": lead.lead_code})
+
+        create_kwargs = dict(
+            customer_name=name,
+            customer_phone=phone or "",
+            email=email,
+            source="SALESIQ",
+            salesiq_visitor_id=visitor_id,
+            raw_payload=payload,
+        )
+        if hasattr(Lead, "issue_detail") and issue_detail:
+            create_kwargs["issue_detail"] = issue_detail
+
+        lead = Lead.objects.create(**create_kwargs)
+        return Response({"message": "Lead created", "lead_code": lead.lead_code}, status=201)
