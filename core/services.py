@@ -1,13 +1,19 @@
-from typing import Optional, Tuple
+from __future__ import annotations
+
+from typing import Optional, Tuple, Dict, Any, Union
 import requests
 from math import radians, sin, cos, asin, sqrt
 
 from .models import Shop, Complaint, Growtags
 
 # -------------------------------------------------------------------
-#  CONSTANTS
+#  CONSTANTS + CACHE
 # -------------------------------------------------------------------
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+USER_AGENT = "mobileservice_django/1.0"
+
+# key -> (lat, lon, precision)
+_GEOCODE_CACHE: Dict[str, Tuple[float, float, str]] = {}
 
 
 # -------------------------------------------------------------------
@@ -25,7 +31,6 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
     dlat = lat2 - lat1
     dlon = lon2 - lon1
 
-    # ✅ correct formula (you had *2 instead of **2 earlier)
     a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
     a = max(0.0, min(1.0, a))  # safety
     c = 2 * asin(sqrt(a))
@@ -38,41 +43,70 @@ def km_between(lat1, lon1, lat2, lon2) -> float:
 
 
 # -------------------------------------------------------------------
-#  GEOCODING HELPERS (only when we DON'T have lat/lon)
+#  GEOCODING HELPERS
 # -------------------------------------------------------------------
-def geocode_address_pincode(area: str, pincode: str) -> Optional[Tuple[float, float]]:
-    query_list = []
-    # 2️⃣ Pincode only (good centroid of 673638)
-    if pincode:
-        query_list.append(f"{pincode}, Kerala, India")
+GeocodeResult = Tuple[float, float, str]  # (lat, lon, precision)
 
-    # 1️⃣ Most specific: area + pincode + Kerala
+
+def _cache_key(prefix: str, area: str, pincode: str, region: str) -> str:
+    area = (area or "").strip().lower()
+    pincode = (str(pincode).strip().lower()) if pincode else ""
+    region = (region or "").strip().lower()
+    return f"{prefix}|{area}|{pincode}|{region}"
+
+
+
+def geocode_address_pincode(area: str, pincode: str) -> Optional[GeocodeResult]:
+    """
+    Returns (lat, lon, precision)
+      precision in {"area_pincode", "pincode", "area_only"}
+    """
+    pincode = str(pincode).strip() if pincode else ""
+    area = (area or "").strip()
+
+    tagged = []
     if area and pincode:
-        query_list.append(f"{area}, {pincode}, Kerala, India")
-        query_list.append(f"{area}, {pincode}, India")
-
-   
-
-    # 3️⃣ Very loose: area only → keep as LAST fallback
+        tagged.append(("area_pincode", f"{area}, {pincode}, Kerala, India"))
+        tagged.append(("area_pincode", f"{area}, {pincode}, India"))
+       
+    if pincode:
+        tagged.append(("pincode", f"{pincode}, Kerala, India"))
     if area:
-        query_list.append(f"{area}, Kerala, India")
+        tagged.append(("area_only", f"{area}, Kerala, India"))
+    for precision, query in tagged:
+       cache_key = query.lower().strip()
+       if cache_key in _GEOCODE_CACHE:
+          return _GEOCODE_CACHE[cache_key]
+    
+    print("GEO TRY:", [q for _, q in tagged])
 
-    print("GEO TRY:", query_list)
-
-    for query in query_list:
+    for precision, query in tagged:
         try:
             resp = requests.get(
                 NOMINATIM_URL,
-                params={"q": query, "format": "json", "limit": 1},
-                headers={"User-Agent": "mobileservice_django/1.0"},
+                params={"q": query, "format": "json", "limit": 3, "addressdetails": 1},
+                headers={"User-Agent": USER_AGENT},
                 timeout=10,
-            )
+                 )
             data = resp.json()
-            if data:
-                lat = float(data[0]["lat"])
-                lon = float(data[0]["lon"])
-                print("FOUND:", query, lat, lon)
-                return lat, lon
+            if not data:
+                continue
+
+            picked = None
+            if pincode:
+                for item in data:
+                    addr = item.get("address") or {}
+                    if (addr.get("postcode") or "").strip() == pincode:
+                        picked = item
+                        break
+
+            picked = picked or data[0]
+            lat = float(picked["lat"])
+            lon = float(picked["lon"])
+            print("FOUND:", query, lat, lon, "precision=", precision)
+
+            _GEOCODE_CACHE[cache_key] = (lat, lon, precision)
+            return lat, lon, precision
         except Exception:
             continue
 
@@ -80,12 +114,66 @@ def geocode_address_pincode(area: str, pincode: str) -> Optional[Tuple[float, fl
     return None
 
 
-
-def geocode_pincode(pincode: str) -> Optional[Tuple[float, float]]:
+def geocode_pincode(pincode: str) -> Optional[GeocodeResult]:
     """
     Fallback: geocode from pincode only.
     """
     return geocode_address_pincode("", pincode)
+
+
+# -------------------------------------------------------------------
+#  COORD RESOLUTION (single source of truth)
+# -------------------------------------------------------------------
+def _should_save_precision(precision: Optional[str]) -> bool:
+    """
+    Save everything except pure pincode centroid.
+    - "area_pincode" is GOOD and should be saved.
+    - "area_only" is weak but still better than nothing (your call).
+    - "pincode" is centroid-like -> do NOT save.
+    """
+    return precision is not None and precision != "pincode"
+
+
+def get_or_geocode_shop_coords(shop: Shop) -> Optional[Tuple[float, float]]:
+    """
+    Returns usable (lat, lon). If geocoded, saves only when precision != "pincode".
+    """
+    if shop.latitude is not None and shop.longitude is not None:
+        return float(shop.latitude), float(shop.longitude)
+
+    loc = geocode_address_pincode(getattr(shop, "area", "") or "", getattr(shop, "pincode", "") or "")
+    if not loc:
+        loc = geocode_pincode(getattr(shop, "pincode", "") or "")
+    if not loc:
+        return None
+
+    lat2, lon2, precision = loc
+    if _should_save_precision(precision):
+        shop.latitude, shop.longitude = lat2, lon2
+        shop.save(update_fields=["latitude", "longitude"])
+
+    return float(lat2), float(lon2)
+
+
+def get_or_geocode_growtag_coords(gt: Growtags) -> Optional[Tuple[float, float]]:
+    """
+    Returns usable (lat, lon). If geocoded, saves only when precision != "pincode".
+    """
+    if gt.latitude is not None and gt.longitude is not None:
+        return float(gt.latitude), float(gt.longitude)
+
+    loc = geocode_address_pincode(getattr(gt, "area", "") or "", getattr(gt, "pincode", "") or "")
+    if not loc:
+        loc = geocode_pincode(getattr(gt, "pincode", "") or "")
+    if not loc:
+        return None
+
+    lat2, lon2, precision = loc
+    if _should_save_precision(precision):
+        gt.latitude, gt.longitude = lat2, lon2
+        gt.save(update_fields=["latitude", "longitude"])
+
+    return float(lat2), float(lon2)
 
 
 # -------------------------------------------------------------------
@@ -108,92 +196,65 @@ def find_nearest_shop(
         qs = qs.filter(shop_type=shop_type.lower())
 
     for shop in qs:
-        if shop.latitude is None or shop.longitude is None:
-            origin = geocode_address_pincode(shop.area or "", shop.pincode) or geocode_pincode(shop.pincode)
-            if origin:
-                shop.latitude, shop.longitude = origin
-                shop.save(update_fields=["latitude", "longitude"])
-            else:
-                continue
+        coords = get_or_geocode_shop_coords(shop)
+        if not coords:
+            continue
 
-        d = km_between(lat, lon, shop.latitude, shop.longitude)
+        use_lat, use_lon = coords
+        d = km_between(lat, lon, use_lat, use_lon)
         if d < best_km:
             best_km = d
             best = shop
 
-    if best is None:
-        return None
-    return best, best_km
+    return None if best is None else (best, best_km)
 
 
 def find_nearest_growtag(lat: float, lon: float) -> Optional[Tuple[Growtags, float]]:
-    """
-    Find nearest active GrowTag from (lat, lon).
-    """
     best: Optional[Growtags] = None
     best_km: float = float("inf")
 
     for gt in Growtags.objects.filter(status="Active"):
-        if gt.latitude is None or gt.longitude is None:
-            origin = geocode_address_pincode(gt.area or "", gt.pincode) or geocode_pincode(gt.pincode)
-            if origin:
-                gt.latitude, gt.longitude = origin
-                gt.save(update_fields=["latitude", "longitude"])
-            else:
-                continue
+        coords = get_or_geocode_growtag_coords(gt)
+        if not coords:
+            continue
 
-        d = km_between(lat, lon, gt.latitude, gt.longitude)
+        use_lat, use_lon = coords
+        d = km_between(lat, lon, use_lat, use_lon)
         if d < best_km:
             best_km = d
             best = gt
 
-    if best is None:
-        return None
-    return best, best_km
+    return None if best is None else (best, best_km)
 
 
 # -------------------------------------------------------------------
 #  HIGH-LEVEL: USE COMPLAINT (lat/lon from frontend + pincode fallback)
 # -------------------------------------------------------------------
-def _ensure_complaint_coords(complaint: Complaint):
-    """
-    Make sure complaint has latitude & longitude.
-
-    1) If frontend already sent lat/lon → do nothing.
-    2) Else, geocode from area + pincode / pincode.
-    """
+def _ensure_complaint_coords(complaint: Complaint) -> None:
     if complaint.latitude is not None and complaint.longitude is not None:
         return
 
-    origin = geocode_address_pincode(complaint.area or "", complaint.pincode) or geocode_pincode(complaint.pincode)
-    if origin:
-        complaint.latitude, complaint.longitude = origin
-        complaint.save(update_fields=["latitude", "longitude"])
+    loc = geocode_address_pincode(getattr(complaint, "area", "") or "", getattr(complaint, "pincode", "") or "")
+    if not loc:
+        loc = geocode_pincode(getattr(complaint, "pincode", "") or "")
+    if not loc:
+        return
+
+    complaint.latitude, complaint.longitude = loc[0], loc[1]
+    complaint.save(update_fields=["latitude", "longitude"])
 
 
 def get_nearest_growtag(complaint: Complaint):
-    """
-    Use complaint.latitude / complaint.longitude to find nearest GrowTag.
-    """
-    # ❗ FIX: reverse of what you had
-    # before you used: if complaint.latitude or complaint.longitude: return None
-    
-
+    _ensure_complaint_coords(complaint)
     if complaint.latitude is None or complaint.longitude is None:
         return None
-
     return find_nearest_growtag(float(complaint.latitude), float(complaint.longitude))
 
 
 def get_nearest_shop(complaint: Complaint, shop_type: str):
-    """
-    Use complaint.latitude / complaint.longitude to find nearest Shop.
-    """
-    
-
+    _ensure_complaint_coords(complaint)
     if complaint.latitude is None or complaint.longitude is None:
         return None
-
     return find_nearest_shop(
         float(complaint.latitude),
         float(complaint.longitude),
@@ -201,80 +262,79 @@ def get_nearest_shop(complaint: Complaint, shop_type: str):
     )
 
 
-
-
-
 # -------------------------------------------------------------------
 #  NEAREST LISTS FOR /nearest-options/ (2nd dropdown)
 # -------------------------------------------------------------------
-def nearest_lists_for_address(area: str, pincode: str):
+def nearest_lists_for_address(area: str, pincode: str, lat=None, lon=None) -> Dict[str, list]:
     """
-    Used by your view:
+    Used by view:
 
-      GET /api/complaints/nearest-options/?area=...&pincode=...
+      GET /api/complaints/nearest-options/?area=...&pincode=...&lat=...&lon=...
 
-    It geocodes area+pincode → user_lat/user_lon,
-    then builds 3 sorted lists: franchise, othershop, growtag.
+    Prefers frontend coords. Otherwise geocodes area+pincode/pincode.
+    Builds 3 sorted lists: franchise, othershop, growtag.
     """
-    origin = geocode_address_pincode(area, pincode) or geocode_pincode(pincode)
-    print("USER ORIGIN:", area, pincode, origin)
-    if not origin:
-        return {
-            "franchise": [],
-            "othershop": [],
-            "growtag": [],
-        }
+    # ---- USER ORIGIN ----
+    def _has_coords(lat, lon) -> bool:
+         return lat is not None and lon is not None and str(lat).strip() != "" and str(lon).strip() != ""
+    if _has_coords(lat, lon):
+        user_lat, user_lon = float(lat), float(lon)
+        origin_precision = "frontend"
+    else:
+        res = geocode_address_pincode(area, pincode)
+        if not res:
+            res = geocode_pincode(pincode)
+        if not res:
+            return {"franchise": [], "othershop": [], "growtag": []}
 
-    user_lat, user_lon = origin
+        user_lat, user_lon, origin_precision = res
 
-    franchise_list = []
-    othershop_list = []
-    growtag_list = []
+    print("USER ORIGIN:", area, pincode, (user_lat, user_lon), "precision=", origin_precision)
 
-    # ---- Shops ----
+    franchise_list: list = []
+    othershop_list: list = []
+    growtag_list: list = []
+
+    # ---- SHOPS ----
     for shop in Shop.objects.filter(status=True):
-        print("SHOP COORDS BEFORE:", shop.id, shop.shopname, shop.latitude, shop.longitude)
-        if shop.latitude is None or shop.longitude is None:
-            loc = geocode_address_pincode(shop.area or "", shop.pincode) or geocode_pincode(shop.pincode)
-            if loc:
-                shop.latitude, shop.longitude = loc
-                shop.save(update_fields=["latitude", "longitude"])
-            else:
-                continue
+        coords = get_or_geocode_shop_coords(shop)
+        if not coords:
+            continue
 
-        dist_km = round(haversine(user_lat, user_lon, shop.latitude, shop.longitude), 2)
-        print("DIST TO SHOP:", shop.id, shop.shopname, dist_km)
+        use_lat, use_lon = coords
+        dist_km = round(haversine(user_lat, user_lon, use_lat, use_lon), 2)
+
         data = {
             "id": shop.id,
             "label": f"{shop.shopname} ({dist_km} km)",
             "distance_km": dist_km,
         }
 
-        if getattr(shop, "shop_type", "") == "franchise":
+        st = (getattr(shop, "shop_type", "") or "").lower()
+        if st == "franchise":
             franchise_list.append(data)
-        else:
+        elif st == "othershop":
             othershop_list.append(data)
 
     franchise_list.sort(key=lambda x: x["distance_km"])
     othershop_list.sort(key=lambda x: x["distance_km"])
 
-    # ---- Growtags ----
-    for g in Growtags.objects.filter(status="Active"):
-        if g.latitude is None or g.longitude is None:
-            loc = geocode_address_pincode(g.area or "", g.pincode) or geocode_pincode(g.pincode)
-            if loc:
-                g.latitude, g.longitude = loc
-                g.save(update_fields=["latitude", "longitude"])
-            else:
-                continue
+    # ---- GROWTAGS ----
+    for gt in Growtags.objects.filter(status="Active"):
+        coords = get_or_geocode_growtag_coords(gt)
+        if not coords:
+            continue
 
-        dist_km = round(haversine(user_lat, user_lon, g.latitude, g.longitude), 2)
+        use_lat, use_lon = coords
+        dist_km = round(haversine(user_lat, user_lon, use_lat, use_lon), 2)
 
-        growtag_list.append({
-            "id": g.id,
-            "label": f"{g.name} - {g.grow_id} ({dist_km} km)",
-            "distance_km": dist_km,
-        })
+        growtag_list.append(
+            {
+                "id": gt.id,
+                "label": f"{gt.name} - {gt.grow_id} ({dist_km} km)",
+                "distance_km": dist_km,
+            }
+        )
 
     growtag_list.sort(key=lambda x: x["distance_km"])
 
@@ -283,7 +343,13 @@ def nearest_lists_for_address(area: str, pincode: str):
         "othershop": othershop_list,
         "growtag": growtag_list,
     }
-from django.db.models import Q
+
+
+# -------------------------------------------------------------------
+#  COMPLAINT -> CUSTOMER SYNC (unchanged)
+# -------------------------------------------------------------------
+from django.db.models import Q  # keep your existing import location if you want
+
 
 def sync_complaint_to_customer(complaint: Complaint):
     customer = complaint.customer
@@ -297,13 +363,8 @@ def sync_complaint_to_customer(complaint: Complaint):
         "customer_phone": complaint.customer_phone,
         "email": complaint.email,
         "password": complaint.password,
-        #"phone_model": complaint.phone_model,
-        #"issue_details": complaint.issue_details,
         "address": complaint.address,
         "pincode": complaint.pincode,
-        #"assign_to": complaint.assign_to,
-        #"assign_type": complaint.assign_to,
-        #"status": complaint.status,
     }
 
     for field, value in sync_map.items():

@@ -1,4 +1,4 @@
-from datetime import timedelta
+
 from decimal import Decimal
 
 from django.utils import timezone
@@ -7,14 +7,15 @@ from django.db.models.functions import TruncMonth,Coalesce
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAdminUser, IsAuthenticated
-from core.authentication import GrowtagTokenAuthentication,ShopTokenAuthentication
+from rest_framework.permissions import IsAdminUser
+from core.authentication import UnifiedTokenAuthentication
 from core.models import Complaint, Shop, Growtags
-from core.permissions import IsGrowtag,IsOtherShop,IsFranchiseShop
+from core.permissions import IsAdminOrGrowtagSelf,IsAdminOrShopSelf
 from zoho_integration.models import LocalInvoice
 import calendar
-
-
+from django.db.models import Min
+from django.db.models.functions import ExtractYear
+from rest_framework_simplejwt.authentication import JWTAuthentication
 
 class AdminDashboardAPIView(APIView):
     permission_classes = [IsAdminUser]
@@ -32,34 +33,37 @@ class AdminDashboardAPIView(APIView):
         # -------------------------
         # TOP CARDS
         # -------------------------
-        total_complaints = Complaint.objects.count()
-        total_growtags = Growtags.objects.count()
-        franchise_shops = Shop.objects.filter(shop_type="franchise").count()
-        other_shops = Shop.objects.filter(shop_type="othershop").count()
+        total_complaints = Complaint.objects.filter(created_at__year=year).count()
+        total_growtags = Growtags.objects.filter(created_at__year=year).count()
+        franchise_shops = Shop.objects.filter(shop_type="franchise", created_at__year=year).count()
+        other_shops = Shop.objects.filter(shop_type="othershop", created_at__year=year).count()
 
-        # ✅ Total Amount (100%) for selected year (optional)
-        total_amount = LocalInvoice.objects.filter(
-            status__in=self.PAID_INVOICE_STATUSES,
-            invoice_date__year=year
+        # ✅ Total Service Charge (100%) for selected year
+        total_service_charge = LocalInvoice.objects.filter(
+           status__in=self.PAID_INVOICE_STATUSES,
+           invoice_date__year=year
         ).aggregate(
             s=Coalesce(
-                Sum("grand_total"),
-                Value(0),
-                output_field=DecimalField(max_digits=12, decimal_places=2),
+               Sum("service_charge_total"),   # ✅ CHANGED
+               Value(0),
+               output_field=DecimalField(max_digits=12, decimal_places=2),
             )
         )["s"]
 
-        # ✅ Admin Earnings (20%) for selected year (this is your total_revenue card)
-        admin_earnings = total_amount * self.ADMIN_SHARE
+        # ✅ Admin Earnings (20%) from service charge
+        admin_earnings = total_service_charge * self.ADMIN_SHARE   # ✅ CHANGED
+
 
         # -------------------------
         # SUMMARY CARDS
         # (keep your status names if they are exactly these)
         # -------------------------
-        today_complaints = Complaint.objects.filter(created_at__date=today).count()
-        pending_complaints = Complaint.objects.filter(status="Pending").count()
-        active_complaints = Complaint.objects.filter(status__in=["Assigned", "In Progress"]).count()
-        resolved_complaints = Complaint.objects.filter(status="Resolved").count()
+        # today only makes sense for current year
+        today_complaints = Complaint.objects.filter(created_at__date=today).count() if year == today.year else 0
+
+        pending_complaints = Complaint.objects.filter(created_at__year=year, status="Pending").count()
+        active_complaints = Complaint.objects.filter(created_at__year=year, status__in=["Assigned", "In Progress"]).count()
+        resolved_complaints = Complaint.objects.filter(created_at__year=year, status="Resolved").count()
 
         # -------------------------
         # CHART: Complaints Overview (Jan-Dec)
@@ -90,7 +94,7 @@ class AdminDashboardAPIView(APIView):
             .values("m")
             .annotate(
                 total_amt=Coalesce(
-                    Sum("grand_total"),
+                    Sum("service_charge_total"),
                     Value(0),
                     output_field=DecimalField(max_digits=12, decimal_places=2),
                 )
@@ -198,36 +202,53 @@ class AdminDashboardAPIView(APIView):
 
 class GrowtagDashboardAPIView(APIView):
     
-    permission_classes = [IsAdminUser]
-    
-
-    DONE_COMPLAINT_STATUSES = ["completed", "resolved"]
+    authentication_classes = [UnifiedTokenAuthentication,JWTAuthentication]
+    permission_classes = [IsAdminOrGrowtagSelf]
+    DONE_COMPLAINT_STATUSES = ["Completed", "Resolved"]
     PAID_INVOICE_STATUSES = ["PAID", "PARTIALLY_PAID"]
 
     # ✅ Only GrowTag share used
     GROWTAG_SHARE = Decimal("0.40")
 
     def get(self, request):
-        growtag_id = request.query_params.get("growtag_id")
-        if not growtag_id:
-            return Response({"detail": "growtag_id is required"}, status=400)
-
-        growtag = Growtags.objects.filter(id=growtag_id).first()
-        if not growtag:
-            return Response({"detail": "Invalid growtag_id"}, status=400)
-
+        
         today = timezone.localdate()
-        year = int(request.query_params.get("year", today.year))
+        try:
+          year = int(request.query_params.get("year", today.year))
+        except ValueError:
+             year = today.year
+        # ✅ decide target growtag
+        if request.user and request.user.is_staff:
+            # admin can pass growtag_id
+            growtag_id = request.query_params.get("growtag_id")
+            if not growtag_id:
+                return Response({"detail": "growtag_id is required"}, status=400)
+            growtag = Growtags.objects.filter(id=growtag_id).first()
+            if not growtag:
+                return Response({"detail": "Invalid growtag_id"}, status=400)
+        else:
+            # growtag can ONLY see own dashboard
+            growtag = request.growtag
+            growtag_id = growtag.id
+
 
         # ==================================================
         # Complaints (Growtag)
         # ==================================================
         cqs = Complaint.objects.filter(assigned_Growtags_id=growtag_id)
+        cqs_year = cqs.filter(created_at__year=year)
 
-        total_assigned = cqs.count()
-        todays_complaints = cqs.filter(created_at__date=today).count()
-        completed_work = cqs.filter(status__in=self.DONE_COMPLAINT_STATUSES).count()
-        pending_work = cqs.exclude(status__in=self.DONE_COMPLAINT_STATUSES).count()
+        total_assigned = cqs_year.count()
+        completed_work = cqs_year.filter(status__in=self.DONE_COMPLAINT_STATUSES).count()
+        pending_work = cqs_year.exclude(status__in=self.DONE_COMPLAINT_STATUSES).count()
+
+        # today card only for current year
+        todays_complaints = (
+                   cqs.filter(created_at__date=today).count()
+                   if year == today.year
+                   else 0
+                )
+
 
         # ==================================================
         # Charts: Always Jan → Dec
@@ -241,18 +262,19 @@ class GrowtagDashboardAPIView(APIView):
         # Complaints Overview Chart
         # --------------------------
         assigned_qs = (
-            cqs.filter(created_at__year=year)
+             cqs_year
             .annotate(m=TruncMonth("created_at"))
             .values("m")
             .annotate(cnt=Count("id"))
-        )
+            )
 
         resolved_qs = (
-            cqs.filter(created_at__year=year, status__in=self.DONE_COMPLAINT_STATUSES)
-            .annotate(m=TruncMonth("created_at"))
-            .values("m")
-            .annotate(cnt=Count("id"))
-        )
+                cqs_year.filter(status__in=self.DONE_COMPLAINT_STATUSES)
+               .annotate(m=TruncMonth("created_at"))
+               .values("m")
+               .annotate(cnt=Count("id"))
+              )
+
 
         for row in assigned_qs:
             assigned_arr[row["m"].month - 1] = row["cnt"]
@@ -266,7 +288,7 @@ class GrowtagDashboardAPIView(APIView):
         inv_qs = LocalInvoice.objects.filter(
             assigned_growtag_id=growtag_id,
             status__in=self.PAID_INVOICE_STATUSES,
-        )
+        ).exclude(invoice_date__isnull=True)
 
         # Monthly totals (100%), convert to Growtag 40% for chart
         monthly_total_qs = (
@@ -275,7 +297,7 @@ class GrowtagDashboardAPIView(APIView):
             .values("m")
             .annotate(
                 total_amt=Coalesce(
-                    Sum("grand_total"),
+                    Sum("service_charge_total"),
                     Value(0),
                     output_field=DecimalField(max_digits=12, decimal_places=2),
                 )
@@ -288,16 +310,16 @@ class GrowtagDashboardAPIView(APIView):
             earnings_arr[idx] = float(month_total * self.GROWTAG_SHARE)
 
         # Year total (100%)
-        total_amount = inv_qs.filter(invoice_date__year=year).aggregate(
+        total_service_charge = inv_qs.filter(invoice_date__year=year).aggregate(
             s=Coalesce(
-                Sum("grand_total"),
+                Sum("service_charge_total"),
                 Value(0),
                 output_field=DecimalField(max_digits=12, decimal_places=2),
             )
         )["s"]  # Decimal
 
         # ✅ Growtag Total Earnings (40%)
-        total_earnings = total_amount * self.GROWTAG_SHARE
+        total_earnings = total_service_charge * self.GROWTAG_SHARE
 
         # ==================================================
         # FINAL RESPONSE
@@ -337,38 +359,49 @@ class GrowtagDashboardAPIView(APIView):
 
 class OtherShopDashboardAPIView(APIView):
     
-    permission_classes = [IsAdminUser]
+    authentication_classes = [UnifiedTokenAuthentication,JWTAuthentication]
+    permission_classes = [IsAdminOrShopSelf] 
 
-    DONE_COMPLAINT_STATUSES = ["completed", "resolved"]
+    DONE_COMPLAINT_STATUSES = ["Completed", "Resolved"]
+
     PAID_INVOICE_STATUSES = ["PAID", "PARTIALLY_PAID"]
 
     SHOP_SHARE = Decimal("0.40")  # ✅ Othershop earnings share
 
     def get(self, request):
-        shop_id = request.query_params.get("shop_id")
-        
-        if not shop_id:
-            return Response({"detail": "shop_id is required"}, status=400)
-
-        shop = Shop.objects.filter(id=shop_id, shop_type="othershop").first()
-        if not shop:
-            return Response({"detail": "Invalid shop_id or not an othershop"}, status=400)
-
-        shop_id = shop.id  # int safe
-
-
         today = timezone.localdate()
         year = int(request.query_params.get("year", today.year))
+        if request.user and request.user.is_staff:
+            shop_id = request.query_params.get("shop_id")
+            if not shop_id:
+                return Response({"detail": "shop_id is required"}, status=400)
+            shop = Shop.objects.filter(id=shop_id, shop_type="othershop").first()
+            if not shop:
+                return Response({"detail": "Invalid shop_id or not an othershop"}, status=400)
+        else:
+            shop = request.shop
+            if shop.shop_type != "othershop":
+                return Response({"detail": "Only othershop can access this dashboard"}, status=403)
+            shop_id = shop.id
+
 
         # ==================================================
         # Complaints (OtherShop)
         # ==================================================
         cqs = Complaint.objects.filter(assigned_shop_id=shop_id)
+        cqs_year = cqs.filter(created_at__year=year)
 
-        total_assigned = cqs.count()
-        todays_complaints = cqs.filter(created_at__date=today).count()
-        completed_work = cqs.filter(status__in=self.DONE_COMPLAINT_STATUSES).count()
-        pending_work = cqs.exclude(status__in=self.DONE_COMPLAINT_STATUSES).count()
+        total_assigned = cqs_year.count()
+        completed_work = cqs_year.filter(status__in=self.DONE_COMPLAINT_STATUSES).count()
+        pending_work = cqs_year.exclude(status__in=self.DONE_COMPLAINT_STATUSES).count()
+
+        # today card only makes sense when year == current year
+        todays_complaints = (
+            cqs.filter(created_at__date=today).count()
+            if year == today.year
+            else 0
+        )
+
 
         # ==================================================
         # Charts: Always Jan → Dec
@@ -419,7 +452,7 @@ class OtherShopDashboardAPIView(APIView):
             .values("m")
             .annotate(
                 total_amt=Coalesce(
-                    Sum("grand_total"),
+                    Sum("service_charge_total"),
                     Value(0),
                     output_field=DecimalField(max_digits=12, decimal_places=2),
                 )
@@ -432,16 +465,16 @@ class OtherShopDashboardAPIView(APIView):
             shop_earnings_arr[idx] = float(month_total * self.SHOP_SHARE)
 
         # Year total amount (100%)
-        total_amount = inv_qs.filter(invoice_date__year=year).aggregate(
+        total_service_charge = inv_qs.filter(invoice_date__year=year).aggregate(
             s=Coalesce(
-                Sum("grand_total"),
+                Sum("service_charge_total"),
                 Value(0),
                 output_field=DecimalField(max_digits=12, decimal_places=2),
             )
         )["s"]
 
         # ✅ Shop total earnings (40%)
-        shop_earnings = total_amount * self.SHOP_SHARE
+        shop_earnings =  total_service_charge * self.SHOP_SHARE
 
         # ==================================================
         # FINAL RESPONSE
@@ -462,7 +495,7 @@ class OtherShopDashboardAPIView(APIView):
                 "pending_work": pending_work,
 
                 # Money
-                "total_amount": float(total_amount),          # 100%
+                "total_service_charge": float(total_service_charge),          # 100%
                 "total_earnings": float(shop_earnings),       # ✅ 40% (main for shop dashboard)
             },
 
@@ -479,37 +512,50 @@ class OtherShopDashboardAPIView(APIView):
             },
         })
 class FranchiseDashboardAPIView(APIView):
+    authentication_classes = [UnifiedTokenAuthentication,JWTAuthentication]
+    permission_classes = [IsAdminOrShopSelf] 
     
-    permission_classes = [IsAdminUser]
-    DONE_COMPLAINT_STATUSES = ["completed", "resolved"]
+    DONE_COMPLAINT_STATUSES = ["Completed", "Resolved"]
+
     PAID_INVOICE_STATUSES = ["PAID", "PARTIALLY_PAID"]
 
     SHOP_SHARE = Decimal("0.40")  # ✅ franchise earnings share
 
     def get(self, request):
-        shop_id = request.query_params.get("shop_id")
-        if not shop_id:
-            return Response({"detail": "shop_id is required"}, status=400)
-
-        shop = Shop.objects.filter(id=shop_id, shop_type="franchise").first()
-        if not shop:
-            return Response({"detail": "Invalid shop_id or not a franchise"}, status=400)
-
-        # ✅ now use shop.id
-        shop_id = shop.id
-
+        
         today = timezone.localdate()
         year = int(request.query_params.get("year", today.year))
+        if request.user and request.user.is_staff:
+            shop_id = request.query_params.get("shop_id")
+            if not shop_id:
+                return Response({"detail": "shop_id is required"}, status=400)
 
+            shop = Shop.objects.filter(id=shop_id, shop_type="franchise").first()
+            if not shop:
+                return Response({"detail": "Invalid shop_id or not a franchise"}, status=400)
+
+        else:
+            shop = request.shop
+            if shop.shop_type != "franchise":
+                return Response({"detail": "Only franchise can access this dashboard"}, status=403)
+            shop_id = shop.id
         # ==================================================
         # Complaints (Franchise shop)
         # ==================================================
         cqs = Complaint.objects.filter(assigned_shop_id=shop_id)
+        cqs_year = cqs.filter(created_at__year=year)
 
-        total_assigned = cqs.count()
-        todays_complaints = cqs.filter(created_at__date=today).count()
-        completed_work = cqs.filter(status__in=self.DONE_COMPLAINT_STATUSES).count()
-        pending_work = cqs.exclude(status__in=self.DONE_COMPLAINT_STATUSES).count()
+        total_assigned = cqs_year.count()
+        completed_work = cqs_year.filter(status__in=self.DONE_COMPLAINT_STATUSES).count()
+        pending_work = cqs_year.exclude(status__in=self.DONE_COMPLAINT_STATUSES).count()
+
+        # today card only makes sense when year == current year
+        todays_complaints = (
+            cqs.filter(created_at__date=today).count()
+            if year == today.year
+            else 0
+        )
+
 
         # ✅ optional card: work assigned to growtag (from this shop complaints)
         work_assigned_to_growtag = cqs.filter(assigned_Growtags__isnull=False).count()
@@ -568,7 +614,7 @@ class FranchiseDashboardAPIView(APIView):
             .values("m")
             .annotate(
                 total_amt=Coalesce(
-                    Sum("grand_total"),
+                    Sum("service_charge_total"),
                     Value(0),
                     output_field=DecimalField(max_digits=12, decimal_places=2),
                 )
@@ -580,15 +626,15 @@ class FranchiseDashboardAPIView(APIView):
             month_total = row["total_amt"]
             franchise_earnings_arr[idx] = float(month_total * self.SHOP_SHARE)
 
-        total_amount = inv_qs.filter(invoice_date__year=year).aggregate(
+        total_service_charge = inv_qs.filter(invoice_date__year=year).aggregate(
             s=Coalesce(
-                Sum("grand_total"),
+                Sum("service_charge_total"),
                 Value(0),
                 output_field=DecimalField(max_digits=12, decimal_places=2),
             )
         )["s"]
 
-        franchise_earnings = total_amount * self.SHOP_SHARE
+        franchise_earnings = total_service_charge * self.SHOP_SHARE
 
         # ==================================================
         # FINAL RESPONSE
@@ -624,4 +670,139 @@ class FranchiseDashboardAPIView(APIView):
                     "amounts": franchise_earnings_arr,  # ✅ 40% trend
                 },
             },
+        })
+    
+#year dropdown
+
+class AdminDashboardMetaAPIView(APIView):
+    
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        current_year = timezone.localdate().year
+
+        # Prefer invoice start year (most reliable for revenue dashboards)
+        min_invoice_year = (
+            LocalInvoice.objects
+            .exclude(invoice_date__isnull=True)
+            .annotate(y=ExtractYear("invoice_date"))
+            .aggregate(min_y=Min("y"))
+            .get("min_y")
+        )
+
+        # Fallback to complaints if invoices not available
+        min_complaint_year = (
+            Complaint.objects
+            .exclude(created_at__isnull=True)
+            .annotate(y=ExtractYear("created_at"))
+            .aggregate(min_y=Min("y"))
+            .get("min_y")
+        )
+
+        start_year = min_invoice_year or min_complaint_year or current_year
+        start_year = int(start_year)
+
+        years = list(range(start_year, current_year + 1))
+
+        return Response({
+            "start_year": start_year,
+            "current_year": current_year,
+            "years": years,
+            "default_year": current_year,
+        })
+class GrowtagDashboardMetaAPIView(APIView):
+    authentication_classes = [UnifiedTokenAuthentication,JWTAuthentication]
+    permission_classes = [IsAdminOrGrowtagSelf]
+
+    def get(self, request):
+        growtag_id = request.query_params.get("growtag_id")
+        if not growtag_id:
+            return Response({"detail": "growtag_id is required"}, status=400)
+        if not Growtags.objects.filter(id=growtag_id).exists():
+            return Response({"detail": "Invalid growtag_id"}, status=400)
+
+        current_year = timezone.localdate().year
+
+        min_invoice_year = (
+            LocalInvoice.objects
+            .filter(assigned_growtag_id=growtag_id)
+            .exclude(invoice_date__isnull=True)
+            .annotate(y=ExtractYear("invoice_date"))
+            .aggregate(min_y=Min("y"))
+            .get("min_y")
+        )
+
+        min_complaint_year = (
+            Complaint.objects
+            .filter(assigned_Growtags_id=growtag_id)
+            .exclude(created_at__isnull=True)
+            .annotate(y=ExtractYear("created_at"))
+            .aggregate(min_y=Min("y"))
+            .get("min_y")
+        )
+
+        start_year = min_invoice_year or min_complaint_year or current_year
+        start_year = int(start_year)
+        if start_year > current_year:
+            start_year = current_year
+
+        years = list(range(start_year, current_year + 1))
+
+        return Response({
+            "start_year": start_year,
+            "current_year": current_year,
+            "years": years,
+            "default_year": current_year,
+        })
+class ShopDashboardMetaAPIView(APIView):
+    authentication_classes = [UnifiedTokenAuthentication,JWTAuthentication]
+    permission_classes = [IsAdminOrShopSelf]
+
+    def get(self, request):
+        shop_id = request.query_params.get("shop_id")
+        if not shop_id:
+            return Response({"detail": "shop_id is required"}, status=400)
+
+        shop = Shop.objects.filter(id=shop_id).first()
+        if not shop:
+            return Response({"detail": "Invalid shop_id"}, status=400)
+
+        current_year = timezone.localdate().year
+
+        min_invoice_year = (
+            LocalInvoice.objects
+            .filter(assigned_shop_id=shop_id)
+            .exclude(invoice_date__isnull=True)
+            .annotate(y=ExtractYear("invoice_date"))
+            .aggregate(min_y=Min("y"))
+            .get("min_y")
+        )
+
+        min_complaint_year = (
+            Complaint.objects
+            .filter(assigned_shop_id=shop_id)
+            .exclude(created_at__isnull=True)
+            .annotate(y=ExtractYear("created_at"))
+            .aggregate(min_y=Min("y"))
+            .get("min_y")
+        )
+
+        start_year = min_invoice_year or min_complaint_year or current_year
+        start_year = int(start_year)
+
+        if start_year > current_year:
+            start_year = current_year
+
+        years = list(range(start_year, current_year + 1))
+
+        return Response({
+            "shop": {
+                "id": shop.id,
+                "name": getattr(shop, "shopname", None) or str(shop),
+                "shop_type": shop.shop_type,
+            },
+            "start_year": start_year,
+            "current_year": current_year,
+            "years": years,
+            "default_year": current_year,
         })

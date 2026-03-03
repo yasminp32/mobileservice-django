@@ -1,32 +1,19 @@
 from rest_framework import serializers
 from decimal import Decimal
 from .models import LocalInvoice, LocalInvoiceLine, LocalCustomer, LocalItem
+from django.urls import reverse
 class LocalItemSerializer(serializers.ModelSerializer):
+    status = serializers.BooleanField(source="is_active",read_only=True)
     class Meta:
         model = LocalItem
         fields = "__all__"
-        read_only_fields = ("zoho_item_id", "sync_status", "created_at","created_on","created_by","updated_at")
-    def validate(self, attrs):
-        # If not sellable → force selling_price = 0
-        if attrs.get("is_sellable") is False:
-            attrs["selling_price"] = 0
-
-        # If not purchasable → force cost_price = 0
-        if attrs.get("is_purchasable") is False:
-            attrs["cost_price"] = 0
-
-        return attrs
+        read_only_fields = ("zoho_item_id", "sync_status",  "created_at","created_on","created_by","updated_at")
     
     #invoice
-
-from rest_framework import serializers
-from django.db import transaction
-from .models import LocalInvoice, LocalInvoiceLine, LocalItem
 
 
 class LocalInvoiceLineReadSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.name", read_only=True)
-
     class Meta:
         model = LocalInvoiceLine
         fields = [
@@ -45,13 +32,11 @@ class LocalInvoiceLineReadSerializer(serializers.ModelSerializer):
             "line_tax",
             "line_total",
             "created_at",
-            "created_on",
-            "created_by",
+            #"created_on",
+            #"created_by",
             "updated_at",
             
         ]
-
-
 class LocalInvoiceLineWriteSerializer(serializers.Serializer):
     item_id = serializers.IntegerField()
     qty = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default="1.00")
@@ -77,7 +62,30 @@ class LocalInvoiceReadSerializer(serializers.ModelSerializer):
     assigned_shop_type = serializers.CharField(source="assigned_shop.shop_type", read_only=True)
     assigned_shop_name = serializers.CharField(source="assigned_shop.shopname", read_only=True)
     growtag_name = serializers.CharField(source="assigned_growtag.name", read_only=True)
+    created_by_display = serializers.SerializerMethodField()
+    pdf_url = serializers.SerializerMethodField()
+    def get_created_by_display(self, obj):
+        # admin
+        if obj.created_by_id:
+           u = obj.created_by
+           return {"type": "admin", "id": u.id, "name": getattr(u, "username", str(u))}
 
+        # shop
+        if obj.created_by_shop_id:
+           s = obj.created_by_shop
+           return {"type": "shop", "id": s.id, "name": getattr(s, "shopname", ""), "shop_type": getattr(s, "shop_type", None)}
+
+        # growtag
+        if obj.created_by_growtag_id:
+           g = obj.created_by_growtag
+           return {"type": "growtag", "id": g.id, "name": getattr(g, "name", "")}
+
+        # customer
+        if obj.created_by_customer_id:
+           c = obj.created_by_customer
+           return {"type": "customer", "id": c.id, "name": getattr(c, "name", "")}
+
+        return None
     class Meta:
         model = LocalInvoice
         fields = [
@@ -109,12 +117,18 @@ class LocalInvoiceReadSerializer(serializers.ModelSerializer):
             "sync_status",
             "last_error",
             "created_at",
-            "created_on",
-            "created_by",
+            #"created_on",
+            #"created_by",
             "updated_at",
             "lines",
+            "created_by_display",
+            "pdf_url", 
+           
         ]
-
+    def get_pdf_url(self, obj):
+        request = self.context.get("request")
+        url = reverse("invoice-pdf", kwargs={"pk": obj.pk})
+        return request.build_absolute_uri(url) if request else url
 
 class LocalInvoiceWriteSerializer(serializers.ModelSerializer):
     # 👇 list of line items (POST/PUT/PATCH in JSON "Raw data")
@@ -124,6 +138,7 @@ class LocalInvoiceWriteSerializer(serializers.ModelSerializer):
         model = LocalInvoice
         fields = [
             "customer",
+            "complaint",
             "assigned_growtag",   
             "assigned_shop",      
             "status",
@@ -149,6 +164,15 @@ class LocalInvoiceWriteSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"discount_value": "Percent must be 0..100"})
         if dt == "AMOUNT" and dv < 0:
             raise serializers.ValidationError({"discount_value": "Amount cannot be negative"})
+        # ✅ NEW: invoice must be for shop OR growtag (not both)
+        # ✅ owner mandatory always
+        shop = attrs.get("assigned_shop") if "assigned_shop" in attrs else getattr(self.instance, "assigned_shop", None)
+        growtag = attrs.get("assigned_growtag") if "assigned_growtag" in attrs else getattr(self.instance, "assigned_growtag", None)
+
+        if shop and growtag:
+            raise serializers.ValidationError("Invoice cannot be assigned to both shop and growtag.")
+        if not shop and not growtag:
+            raise serializers.ValidationError("Invoice must be assigned to either shop or growtag.")
 
         return attrs
     def validate_lines_payload(self, lines):
@@ -161,3 +185,26 @@ class LocalInvoiceWriteSerializer(serializers.ModelSerializer):
         if missing:
             raise serializers.ValidationError(f"Invalid item_id(s): {missing}")
         return lines
+    
+
+    def _upsert_lines(self, invoice, lines_payload):
+        """
+        Creates invoice lines from payload.
+        (Simple version: always create new lines)
+        """
+        if not lines_payload:
+            return
+
+        for row in lines_payload:
+            LocalInvoiceLine.objects.create(
+                invoice=invoice,
+                item_id=row["item_id"],
+                qty=row.get("qty", Decimal("1.00")),
+                rate=row.get("rate", Decimal("0.00")),
+                description=row.get("description", ""),
+                service_charge_type=row.get("service_charge_type", "AMOUNT"),
+                service_charge_value=row.get("service_charge_value", Decimal("0.00")),
+                gst_treatment=row.get("gst_treatment", "NO_TAX"),
+            )
+
+    

@@ -1,6 +1,6 @@
 from django.conf import settings
 from django.db import models
-
+from django.core.exceptions import ValidationError
 
 class ExpenseCategory(models.Model):
     name = models.CharField(max_length=80, unique=True)
@@ -29,6 +29,14 @@ class Expense(models.Model):
         ("APPROVED", "Approved"),
         ("REJECTED", "Rejected"),
     ]
+    OWNER_CHOICES = [
+        ("shop", "Shop"),
+        ("growtag", "Growtag"),
+        ("admin", "Admin"),
+    ]
+    owner_type = models.CharField(max_length=10, choices=OWNER_CHOICES, default="admin")
+    owner_shop = models.ForeignKey("core.Shop", on_delete=models.CASCADE, null=True, blank=True)
+    owner_growtag = models.ForeignKey("core.Growtags", on_delete=models.CASCADE, null=True, blank=True)
 
     title = models.CharField(max_length=150)
     merchant = models.CharField(max_length=150)
@@ -58,7 +66,27 @@ class Expense(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+     # ✅ validation so data stays correct
+    def clean(self):
+        if self.owner_type == "shop":
+            if not self.owner_shop:
+                raise ValidationError({"owner_shop": "owner_shop is required when owner_type=shop"})
+            if self.owner_growtag:
+                raise ValidationError({"owner_growtag": "must be empty when owner_type=shop"})
 
+        if self.owner_type == "growtag":
+            if not self.owner_growtag:
+                raise ValidationError({"owner_growtag": "owner_growtag is required when owner_type=growtag"})
+            if self.owner_shop:
+                raise ValidationError({"owner_shop": "must be empty when owner_type=growtag"})
+
+        if self.owner_type == "admin":
+            if self.owner_shop or self.owner_growtag:
+                raise ValidationError("Admin expense must not have owner_shop/owner_growtag")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()  # enforce the above rules
+        return super().save(*args, **kwargs)
     def __str__(self):
         return f"{self.title} - {self.amount}"
 

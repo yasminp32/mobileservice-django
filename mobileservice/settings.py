@@ -2,35 +2,50 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 from dotenv import load_dotenv
+from django.contrib.auth import get_user_model
+from corsheaders.defaults import default_headers, default_methods
 
 load_dotenv()
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 print("DEBUG SETTINGS.ZOHO_CLIENT_ID =", os.getenv("ZOHO_CLIENT_ID"))
 
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
-DEBUG = os.getenv("DEBUG", "1") == "1"
+SECRET_KEY = os.environ["SECRET_KEY"]
+DEBUG = False
 #ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "127.0.0.1,localhost").split(",")
 ALLOWED_HOSTS = [
     "127.0.0.1",
     "localhost",
-    ".ngrok-free.dev",
-     ".loclx.io",
-]
-CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOW_ALL_ORIGINS = True
-
-
-CORS_ALLOWED_ORIGINS = [
-    "http://127.0.0.1:5500",
-    "http://localhost:5173",
-    "https://ce8beda6663d.ngrok-free.app",
+    ".onrender.com",
 ]
 
-CORS_ALLOW_HEADERS = ["*"]
-CORS_ALLOW_METHODS = ["*"]
 CORS_ALLOW_CREDENTIALS = True
+
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^http://localhost:\d+$",
+    r"^http://127\.0\.0\.1:\d+$",
+    r"^https://.*\.ngrok-free\.app$",
+    r"^https://.*\.ngrok\.io$",
+    r"^https://.*\.ngrok-free\.dev$",
+]
+
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    "Authorization",
+]
+
+CORS_ALLOW_METHODS = list(default_methods)
+
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost",
+    "http://127.0.0.1",
+    "https://*.ngrok-free.app",
+    "https://*.ngrok.io",
+    "https://*.ngrok-free.dev",
+]
+
+
 #print("LOADED ALLOWED_HOSTS =", ALLOWED_HOSTS)
 LOGIN_REDIRECT_URL = "/api/"
 LOGOUT_REDIRECT_URL = "/api/"
@@ -47,10 +62,13 @@ INSTALLED_APPS = [
     "core",
     "zoho_integration",
     "expenses",
+    "corsheaders",
 ]
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -115,8 +133,9 @@ LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
-
-STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+STATIC_URL = "/static/"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
@@ -143,10 +162,12 @@ EMAIL_HOST = "smtp.gmail.com"
 EMAIL_PORT = 587
 EMAIL_USE_TLS = True
 
-EMAIL_HOST_USER = "yasminp32@gmail.com"
-EMAIL_HOST_PASSWORD = "vaxw jwwf voap bzxh"  # NOT your Gmail password
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD")  # NOT your Gmail password
 
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+
+FRONTEND_RESET_URL = "http://localhost:8000/reset-password"
 # =========================
 # ZOHO BOOKS CONFIGURATION
 # =========================
@@ -169,3 +190,9 @@ ZOHO_SERVICE_INCOME_ACCOUNT_ID = os.getenv("ZOHO_SERVICE_INCOME_ACCOUNT_ID", "")
 ZOHO_COGS_ACCOUNT_ID = os.getenv("ZOHO_COGS_ACCOUNT_ID", "")
 ZOHO_OTHER_INCOME_ACCOUNT_ID = os.getenv("ZOHO_OTHER_INCOME_ACCOUNT_ID", "")
 
+from datetime import timedelta
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=24),   # 🔥 Change here
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+}

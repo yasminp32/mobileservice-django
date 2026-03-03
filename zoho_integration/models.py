@@ -3,18 +3,53 @@ from django.conf import settings
 from django.db.models import Max
 from django.db import transaction
 from core.models import Growtags, Shop
+from django.core.exceptions import ValidationError
 
+# core/models.py (AuditFields)
 
 class AuditFields(models.Model):
-    created_at = models.DateTimeField(auto_now_add=True)   # datetime created
-    updated_at = models.DateTimeField(auto_now=True)       # datetime updated
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
-    created_on = models.DateField(null=True, blank=True)   # optional date-only
+    created_on = models.DateField(null=True, blank=True)
+
+    # admin user (JWT)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True, blank=True,
         on_delete=models.SET_NULL,
-        related_name="%(class)s_created"
+        related_name="%(class)s_created",
+    )
+
+    # ✅ token roles
+    created_by_role = models.CharField(
+        max_length=20,
+        null=True, blank=True,
+        choices=[
+            ("admin", "Admin"),
+            ("shop", "Shop"),
+            ("growtag", "Growtag"),
+            ("customer", "Customer"),
+        ],
+    )
+
+    created_by_shop = models.ForeignKey(
+        "core.Shop",
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="%(class)s_created_shop",
+    )
+    created_by_growtag = models.ForeignKey(
+        "core.Growtags",
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="%(class)s_created_growtag",
+    )
+    created_by_customer = models.ForeignKey(
+        "core.Customer",
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="%(class)s_created_customer",
     )
 
     class Meta:
@@ -126,7 +161,13 @@ class LocalItem(AuditFields):
         blank=True
     )
     purchase_description = models.TextField(blank=True, default="")
+    is_active = models.BooleanField(default=True)
+    #category = models.CharField(max_length=120, blank=True, default="")
+    #opening_stock = models.PositiveIntegerField(default=0)
+    #is_active = models.BooleanField(default=True)
 
+    # (Optional) maintain current_stock too if you want
+    #current_stock = models.PositiveIntegerField(default=0)
     # Zoho sync
     zoho_item_id = models.CharField(max_length=100, blank=True, null=True)
     sync_status = models.CharField(max_length=20, default="PENDING")  # PENDING/SYNCED/FAILED
@@ -172,9 +213,15 @@ class LocalInvoice(AuditFields):
         ("IGST_18", "18% IGST"),
         ("IGST_28", "28% IGST"),
     ]
-
+    complaint = models.OneToOneField(
+        "core.Complaint",
+        on_delete=models.PROTECT,
+        related_name="invoice",
+        null=True,
+        blank=True
+    )
     customer = models.ForeignKey(LocalCustomer, on_delete=models.PROTECT)
-    invoice_number = models.CharField(max_length=50, null=True, blank=True,unique=True, db_index=True)  # INV-001
+    invoice_number = models.CharField(max_length=50, blank=True, default="", unique=True, db_index=True) # INV-001
     def _generate_next_invoice_number(self) -> str:
         """
         Generates next invoice number like INV-0001, INV-0002...
@@ -198,16 +245,34 @@ class LocalInvoice(AuditFields):
             last_num = 0
 
         return f"INV-{last_num + 1:04d}"
-
+    def clean(self):
+      if self.assigned_shop_id and self.assigned_growtag_id:
+        raise ValidationError("Invoice cannot be assigned to both shop and growtag.")
+      if not self.assigned_shop_id and not self.assigned_growtag_id:
+        raise ValidationError("Invoice must be assigned to either shop or growtag.")
+      
     def save(self, *args, **kwargs):
+        # ✅ enforce clean() every time (owner mandatory)
+        validate = kwargs.pop("validate", True)
         # Generate only on create
         if not self.pk and not self.invoice_number:
             with transaction.atomic():
                 self.invoice_number = self._generate_next_invoice_number()
+                if validate:
+                   self.full_clean()
                 super().save(*args, **kwargs)   # ✅ save INSIDE the transaction
             return
-
+        if validate:
+           self.full_clean()
         super().save(*args, **kwargs)
+    @property
+    def owner_type(self):
+       if self.assigned_shop_id:
+          return "shop"
+       if self.assigned_growtag_id:
+          return "growtag"
+       return None
+
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="DRAFT")
 
     invoice_date = models.DateField()
@@ -282,7 +347,8 @@ class LocalInvoiceLine(AuditFields):
     line_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)           # taxable_amount + line_tax
     
     def __str__(self):
-        return f"Line #{self.id} - {self.item_id} (inv:{self.invoice_id})"
+       return f"Line #{self.id} - item:{self.item_id} (inv:{self.invoice_id})"
+
     # -----------------------------
     # Helpers
     # -----------------------------
@@ -333,13 +399,14 @@ class LocalInvoiceLine(AuditFields):
         self.line_total = total
 
         if save:
-            self.save(update_fields=[
-                "line_amount", "service_charge_amount", "taxable_amount",
-                "line_tax", "line_total", "updated_at"
-            ])
+            super(LocalInvoiceLine, self).save(update_fields=[
+                    "line_amount", "service_charge_amount", "taxable_amount",
+                    "line_tax", "line_total", "updated_at"
+         ])
 
     def save(self, *args, **kwargs):
-        # auto-calc every save
-        self.recalc(save=False)
+        do_recalc = kwargs.pop("recalc", True)
+        if do_recalc:
+           self.recalc(save=False)
         super().save(*args, **kwargs)
     
